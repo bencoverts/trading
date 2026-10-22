@@ -443,9 +443,7 @@ export class MarketService {
       recordAudit(this.db, {
         actorUserId: ctx.actorUserId,
         actorRole: 'admin',
-        action: startPriceChanged
-          ? 'admin.market_price_changed'
-          : (labels.audit ?? 'admin.market_updated'),
+        action: startPriceChanged ? 'admin.market_price_changed' : (labels.audit ?? 'admin.market_updated'),
         targetType: 'market',
         targetId: row.symbol,
         meta: { patch, before, startPriceChanged },
