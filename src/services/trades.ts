@@ -2,7 +2,7 @@ import type { Database } from '../db/sqlite.js';
 import type { PriceEngine } from '../price/engine.js';
 import type { SettingsService } from './settings.js';
 import type { WalletService } from './wallets.js';
-import type { MarketService } from './markets.js';
+import type { MarketService, MarketRow } from './markets.js';
 import type { Clock } from '../lib/clock.js';
 import type { Logger } from '../lib/logger.js';
 import { Emitter } from '../lib/emitter.js';
@@ -62,10 +62,10 @@ export interface TradeView {
   settledBy: 'expiry' | 'admin' | null;
   settleReason: string | null;
   createdAt: number;
-  /** server-computed live estimate for open trades */
   livePrice?: number | null;
   estimatedResult?: TradeResult | 'pending' | null;
   estimatedPayout?: number | null;
+  sim: true;
 }
 
 export const toTradeView = (row: TradeRow): TradeView => {
@@ -95,6 +95,7 @@ export const toTradeView = (row: TradeRow): TradeView => {
     settledBy: row.settled_by,
     settleReason: row.settle_reason,
     createdAt: Number(row.created_at),
+    sim: true,
   };
 };
 
@@ -134,6 +135,18 @@ const isUniqueViolation = (err: unknown): boolean => {
   );
 };
 
+/** Payout rate resolution: per-market override, then per-duration, then global. */
+export function resolvePayoutRate(
+  settings: { payoutRate: number; payoutByDuration: Record<string, number> },
+  market: MarketRow | undefined,
+  durationSec: number,
+): number {
+  if (market?.payout_rate !== null && market?.payout_rate !== undefined) return Number(market.payout_rate);
+  const perDuration = settings.payoutByDuration[String(durationSec)];
+  if (perDuration !== undefined) return perDuration;
+  return settings.payoutRate;
+}
+
 export class TradeService {
   readonly events = new Emitter<TradeEvents>();
 
@@ -143,59 +156,86 @@ export class TradeService {
     return this.deps.db;
   }
 
-  /** Business rules that do not need the database. */
-  validateIntent(input: { market: string; currency: Currency; amountMinor: number; durationSec: number }): void {
+  validateIntent(input: {
+    userId: string;
+    market: string;
+    currency: Currency;
+    amountMinor: number;
+    durationSec: number;
+  }): MarketRow {
     const settings = this.deps.settings.get();
     const market = this.deps.markets.requireRow(input.market);
-    if (market.active !== 1) {
-      throw new AppError('MARKET_CLOSED', 422, `Market ${market.symbol} is closed`);
-    }
-    if (market.paused === 1) {
-      throw new AppError('MARKET_PAUSED', 422, `Market ${market.symbol} is paused`, { reason: market.pause_reason });
+    const state = this.deps.markets.isTradeable(market, this.deps.clock.now());
+    if (!state.ok) {
+      throw AppError.unprocessable(
+        (state.code as 'MARKET_PAUSED') ?? 'MARKET_CLOSED',
+        state.message ?? 'Market tidak bisa ditradingkan',
+      );
     }
     if (!Number.isInteger(input.durationSec) || input.durationSec < 5 || input.durationSec > 28_800) {
-      throw AppError.unprocessable('DURATION_NOT_ALLOWED', 'durationSec must be between 5 and 28800');
+      throw AppError.unprocessable('DURATION_NOT_ALLOWED', 'Durasi harus antara 5 dan 28800 detik');
     }
     if (!settings.allowedDurations.includes(input.durationSec)) {
-      throw AppError.unprocessable('DURATION_NOT_ALLOWED', `durationSec must be one of ${settings.allowedDurations.join(', ')}`, {
+      throw AppError.unprocessable('DURATION_NOT_ALLOWED', 'Durasi tidak diizinkan', {
         allowedDurations: settings.allowedDurations,
       });
     }
     if (!Number.isInteger(input.amountMinor) || input.amountMinor <= 0) {
-      throw AppError.badRequest('amount must be greater than 0');
+      throw AppError.badRequest('Nominal harus lebih dari 0');
     }
-    const min = settings.minAmount[input.currency];
-    const max = settings.maxAmount[input.currency];
-    if (input.amountMinor < min || input.amountMinor > max) {
-      throw AppError.unprocessable('AMOUNT_NOT_ALLOWED', `amount must be between ${min} and ${max} minor units`, {
-        minMinor: min,
-        maxMinor: max,
-        currency: input.currency,
+    const scale = input.currency === 'IDR' ? 1 : 100;
+    const usdRate = settings.rates[input.currency] ?? 1;
+    const amountUsdMinor = Math.round((input.amountMinor / scale / usdRate) * 100);
+    const globalMaxUsd = settings.globalMaxAmountUsdMinor;
+    if (globalMaxUsd > 0 && amountUsdMinor > globalMaxUsd) {
+      throw AppError.unprocessable('AMOUNT_NOT_ALLOWED', 'Nominal melebihi batas maksimum akun', {
+        maxAmountUsd: globalMaxUsd / 100,
       });
     }
+    const min =
+      market.min_amount_usd_minor === null
+        ? settings.minAmount[input.currency]
+        : Math.round((market.min_amount_usd_minor / 100) * usdRate * scale);
+    const max =
+      market.max_amount_usd_minor === null
+        ? settings.maxAmount[input.currency]
+        : Math.round((market.max_amount_usd_minor / 100) * usdRate * scale);
+    if (input.amountMinor < min || input.amountMinor > max) {
+      throw AppError.unprocessable(
+        'AMOUNT_NOT_ALLOWED',
+        `Nominal harus antara ${toMajor(min, input.currency)} dan ${toMajor(max, input.currency)} ${input.currency}`,
+        {
+          minMinor: min,
+          maxMinor: max,
+          currency: input.currency,
+        },
+      );
+    }
+    return market;
   }
 
   create(input: CreateTradeInput): { trade: TradeView; replayed: boolean; balanceMinor: number } {
-    this.validateIntent(input);
+    const market = this.validateIntent(input);
     const settings = this.deps.settings.get();
+    const payoutRate = resolvePayoutRate(settings, market, input.durationSec);
 
     if (input.idempotencyKey) {
       const existing = this.findByIdempotency(input.userId, input.idempotencyKey);
       if (existing) {
         if (input.requestHash && existing.request_hash && existing.request_hash !== input.requestHash) {
-          throw new AppError('IDEMPOTENCY_KEY_REUSED', 409, 'Idempotency-Key was already used with a different payload');
+          throw new AppError('IDEMPOTENCY_KEY_REUSED', 409, 'Idempotency-Key sudah dipakai dengan payload berbeda');
         }
         return {
           trade: toTradeView(existing),
           replayed: true,
-          balanceMinor: Number(this.deps.wallets.get(input.userId, input.currency).balance_minor),
+          balanceMinor: Number(this.deps.wallets.get(input.userId, existing.currency).balance_minor),
         };
       }
     }
 
-    const entryPrice = this.deps.engine.lastPrice(input.market);
+    const entryPrice = this.deps.engine.lastPrice(market.symbol);
     if (entryPrice === null) {
-      throw new AppError('CONFLICT', 409, 'Market price is not available yet, retry shortly');
+      throw new AppError('CONFLICT', 409, 'Harga market belum tersedia, coba lagi sebentar');
     }
     const serverNow = this.deps.clock.now();
     const expiry = serverNow + input.durationSec * 1000;
@@ -203,17 +243,45 @@ export class TradeService {
 
     try {
       return this.db.transaction(() => {
-        const open = this.db.get<{ n: number }>(
+        const open = this.db.all<{ currency: string }>(
+          `SELECT currency FROM trades WHERE user_id = ? AND status = 'open' LIMIT 1`,
+          input.userId,
+        );
+        // The user picks a currency when the first trade opens; while any trade
+        // is open the currency cannot be switched (keeps the ledger readable).
+        if (open.length && open[0].currency !== input.currency) {
+          throw new AppError('CURRENCY_LOCKED', 422, 'Tutup semua trade dulu sebelum mengganti mata uang', {
+            lockedCurrency: open[0].currency,
+          });
+        }
+        const openCount = this.db.get<{ n: number }>(
           `SELECT COUNT(*) AS n FROM trades WHERE user_id = ? AND status = 'open'`,
           input.userId,
         );
-        if (Number(open?.n ?? 0) >= settings.maxOpenTrades) {
-          throw AppError.unprocessable('TRADE_LIMIT_REACHED', `Maximum ${settings.maxOpenTrades} open trades`);
+        const maxOpen = Math.min(settings.maxOpenTradesPerUser, settings.maxOpenTrades);
+        if (Number(openCount?.n ?? 0) >= maxOpen) {
+          throw AppError.unprocessable('TRADE_LIMIT_REACHED', `Maksimum ${maxOpen} trade terbuka`);
+        }
+        const limit = market.exposure_limit_usd_minor;
+        if (limit) {
+          const exposure = this.deps.markets.openExposureUsdMinor(market.symbol, settings.rates);
+          const scale = input.currency === 'IDR' ? 1 : 100;
+          const thisUsd = Math.round((input.amountMinor / scale / (settings.rates[input.currency] ?? 1)) * 100);
+          if (exposure + thisUsd > limit) {
+            throw new AppError('EXPOSURE_LIMIT', 422, 'Exposure market ini sudah mencapai batas', {
+              exposureUsd: exposure / 100,
+              limitUsd: limit / 100,
+            });
+          }
         }
 
-        // The debit and the trade insert happen in the same BEGIN IMMEDIATE
-        // transaction - two parallel requests can never both spend the balance.
-        const balanceAfter = this.deps.wallets.debit(input.userId, input.currency, input.amountMinor);
+        // The debit, the ledger entry and the trade insert share this
+        // BEGIN IMMEDIATE transaction - two parallel requests cannot overdraw.
+        const balanceAfter = this.deps.wallets.debit(input.userId, input.currency, input.amountMinor, {
+          kind: 'trade_stake',
+          refType: 'trade',
+          refId: id,
+        });
 
         this.db.run(
           `INSERT INTO trades (id, user_id, market, direction, currency, amount_minor, duration_sec,
@@ -222,7 +290,7 @@ export class TradeService {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)`,
           id,
           input.userId,
-          input.market,
+          market.symbol,
           input.direction,
           input.currency,
           input.amountMinor,
@@ -230,7 +298,7 @@ export class TradeService {
           entryPrice,
           serverNow,
           expiry,
-          settings.payoutRate,
+          payoutRate,
           settings.payoutMode,
           input.idempotencyKey ?? null,
           input.requestHash ?? null,
@@ -244,13 +312,14 @@ export class TradeService {
           targetType: 'trade',
           targetId: id,
           meta: {
-            market: input.market,
+            market: market.symbol,
             direction: input.direction,
             currency: input.currency,
             amountMinor: input.amountMinor,
             durationSec: input.durationSec,
             entryPrice,
             expiryTime: expiry,
+            payoutRate,
           },
           ip: input.ip ?? null,
           now: serverNow,
@@ -266,7 +335,7 @@ export class TradeService {
           return {
             trade: toTradeView(existing),
             replayed: true,
-            balanceMinor: Number(this.deps.wallets.get(input.userId, input.currency).balance_minor),
+            balanceMinor: Number(this.deps.wallets.get(input.userId, existing.currency).balance_minor),
           };
         }
       }
@@ -284,22 +353,89 @@ export class TradeService {
 
   getForUser(userId: string, tradeId: string): TradeView {
     const row = this.row(tradeId);
-    if (!row || row.user_id !== userId) throw AppError.notFound('Trade not found');
+    if (!row || row.user_id !== userId) throw AppError.notFound('Trade tidak ditemukan');
     return this.withEstimate(toTradeView(row));
   }
 
-  listForUser(opts: { userId: string; status?: 'open' | 'closed'; limit?: number; offset?: number }): TradeView[] {
-    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  listForUser(opts: {
+    userId: string;
+    status?: 'open' | 'closed';
+    market?: string;
+    result?: TradeResult;
+    from?: number;
+    to?: number;
+    limit?: number;
+    offset?: number;
+  }): TradeView[] {
+    const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
     const offset = Math.max(opts.offset ?? 0, 0);
+    const clauses = ['user_id = ?'];
     const params: Array<string | number> = [opts.userId];
-    let sql = 'SELECT * FROM trades WHERE user_id = ?';
     if (opts.status) {
-      sql += ' AND status = ?';
+      clauses.push('status = ?');
       params.push(opts.status);
     }
-    sql += ` ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC LIMIT ? OFFSET ?`;
+    if (opts.market) {
+      clauses.push('market = ?');
+      params.push(opts.market.toUpperCase());
+    }
+    if (opts.result) {
+      clauses.push('result = ?');
+      params.push(opts.result);
+    }
+    if (opts.from !== undefined) {
+      clauses.push('created_at >= ?');
+      params.push(opts.from);
+    }
+    if (opts.to !== undefined) {
+      clauses.push('created_at <= ?');
+      params.push(opts.to);
+    }
     params.push(limit, offset);
-    return this.db.all<TradeRow>(sql, ...params).map((row) => this.withEstimate(toTradeView(row)));
+    return this.db
+      .all<TradeRow>(
+        `SELECT * FROM trades WHERE ${clauses.join(' AND ')}
+         ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC LIMIT ? OFFSET ?`,
+        ...params,
+      )
+      .map((row) => this.withEstimate(toTradeView(row)));
+  }
+
+  countForUser(opts: {
+    userId: string;
+    status?: 'open' | 'closed';
+    market?: string;
+    result?: TradeResult;
+    from?: number;
+    to?: number;
+  }): number {
+    const clauses = ['user_id = ?'];
+    const params: Array<string | number> = [opts.userId];
+    if (opts.status) {
+      clauses.push('status = ?');
+      params.push(opts.status);
+    }
+    if (opts.market) {
+      clauses.push('market = ?');
+      params.push(opts.market.toUpperCase());
+    }
+    if (opts.result) {
+      clauses.push('result = ?');
+      params.push(opts.result);
+    }
+    if (opts.from !== undefined) {
+      clauses.push('created_at >= ?');
+      params.push(opts.from);
+    }
+    if (opts.to !== undefined) {
+      clauses.push('created_at <= ?');
+      params.push(opts.to);
+    }
+    const row = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM trades WHERE ${clauses.join(' AND ')}`,
+      ...params,
+    );
+    return Number(row?.n ?? 0);
   }
 
   countOpen(userId: string): number {
@@ -310,7 +446,15 @@ export class TradeService {
     return Number(row?.n ?? 0);
   }
 
-  /** Server-side live estimate for the open-trade list (never trusted from the client). */
+  /** The currency the user is locked into (if any open trade exists). */
+  lockedCurrency(userId: string): Currency | null {
+    const row = this.db.get<{ currency: Currency }>(
+      `SELECT currency FROM trades WHERE user_id = ? AND status = 'open' ORDER BY created_at ASC LIMIT 1`,
+      userId,
+    );
+    return row?.currency ?? null;
+  }
+
   private withEstimate(view: TradeView): TradeView {
     if (view.status !== 'open') return view;
     const live = this.deps.engine.lastPrice(view.market);
@@ -332,7 +476,13 @@ export class TradeService {
   settle(
     row: TradeRow,
     closePrice: number,
-    opts: { now: number; settledBy: 'expiry' | 'admin'; reason?: string | null; actorUserId?: string | null; ip?: string | null },
+    opts: {
+      now: number;
+      settledBy: 'expiry' | 'admin';
+      reason?: string | null;
+      actorUserId?: string | null;
+      ip?: string | null;
+    },
   ): { trade: TradeView; balanceMinor: number } | null {
     if (row.status === 'closed') return null;
     const result = decideResult(row.direction, Number(row.entry_price), closePrice);
@@ -353,7 +503,14 @@ export class TradeService {
       );
       if (claim.changes === 0) return null;
 
-      const balanceMinor = payoutMinor > 0 ? this.deps.wallets.credit(row.user_id, row.currency, payoutMinor) : this.deps.wallets.get(row.user_id, row.currency).balance_minor;
+      const balanceMinor =
+        payoutMinor > 0
+          ? this.deps.wallets.credit(row.user_id, row.currency, payoutMinor, {
+              kind: result === 'draw' ? 'trade_refund' : 'trade_payout',
+              refType: 'trade',
+              refId: row.id,
+            })
+          : this.deps.wallets.get(row.user_id, row.currency).balance_minor;
 
       recordAudit(this.db, {
         actorUserId: opts.actorUserId ?? null,
@@ -381,10 +538,6 @@ export class TradeService {
     return settled;
   }
 
-  /**
-   * Settles every trade whose expiry passed. Called on an interval and once at
-   * boot (which is how trades that expired during downtime get completed).
-   */
   settleDue(now = this.deps.clock.now()): Array<{ trade: TradeView; balanceMinor: number }> {
     const due = this.db.all<TradeRow>(
       `SELECT * FROM trades WHERE status = 'open' AND expiry_time <= ? ORDER BY expiry_time ASC LIMIT 200`,
@@ -392,20 +545,17 @@ export class TradeService {
     );
     const settled: Array<{ trade: TradeView; balanceMinor: number }> = [];
     for (const row of due) {
-      // Price at the exact expiry instant. When absent (server was down for the
-      // whole window) the outcome is unknowable, so the stake is refunded.
       const closePrice = this.deps.engine.priceAt(row.market, Number(row.expiry_time)) ?? Number(row.entry_price);
       try {
         const done = this.settle(row, closePrice, { now, settledBy: 'expiry', reason: null });
         if (done) settled.push(done);
       } catch (err) {
-        this.deps.logger.error({ err, tradeId: row.id }, 'failed to settle trade');
+        this.deps.logger.error({ err, tradeId: row.id }, 'gagal settle trade');
       }
     }
     return settled;
   }
 
-  /** Voids a trade at its entry price (full refund) - used by the demo balance reset. */
   voidAtEntry(tradeId: string, reason: string, actorUserId: string | null, ip?: string | null): TradeView | null {
     const row = this.row(tradeId);
     if (!row || row.status !== 'open') return null;
@@ -419,16 +569,18 @@ export class TradeService {
     return settled?.trade ?? null;
   }
 
-  /** Admin manual settlement for exceptional cases (audited, reason required). */
   manualSettle(
     tradeId: string,
     opts: { closePrice?: number; reason: string; actorUserId: string; ip?: string | null },
   ): TradeView {
     const row = this.row(tradeId);
-    if (!row) throw AppError.notFound('Trade not found');
-    if (row.status !== 'open') throw AppError.conflict('Trade is already settled');
-    const price = opts.closePrice ?? this.deps.engine.priceAt(row.market, this.deps.clock.now());
-    if (price === null) throw AppError.conflict('No price available for manual settlement');
+    if (!row) throw AppError.notFound('Trade tidak ditemukan');
+    if (row.status !== 'open') throw AppError.conflict('Trade sudah diselesaikan');
+    const price =
+      opts.closePrice ??
+      this.deps.engine.priceAt(row.market, this.deps.clock.now()) ??
+      this.deps.engine.lastPrice(row.market);
+    if (price === null) throw AppError.conflict('Tidak ada harga untuk settlement manual');
     const result = this.settle(row, price, {
       now: this.deps.clock.now(),
       settledBy: 'admin',
@@ -436,11 +588,106 @@ export class TradeService {
       actorUserId: opts.actorUserId,
       ip: opts.ip,
     });
-    if (!result) throw AppError.conflict('Trade is already settled');
+    if (!result) throw AppError.conflict('Trade sudah diselesaikan');
     return result.trade;
   }
 
   announceOpened(trade: TradeView, balanceMinor: number): void {
     this.events.emit('opened', { trade, balanceMinor });
+  }
+
+  /** Aggregates used by the admin trade statistics screen. */
+  stats(opts: { from?: number; to?: number } = {}): {
+    byMarket: Array<{
+      market: string;
+      count: number;
+      win: number;
+      lose: number;
+      draw: number;
+      volumeMinor: number;
+      payoutMinor: number;
+    }>;
+    byDuration: Array<{
+      durationSec: number;
+      count: number;
+      win: number;
+      lose: number;
+      draw: number;
+      volumeMinor: number;
+      payoutMinor: number;
+    }>;
+  } {
+    const clauses: string[] = [`status = 'closed'`];
+    const params: number[] = [];
+    if (opts.from !== undefined) {
+      clauses.push('created_at >= ?');
+      params.push(opts.from);
+    }
+    if (opts.to !== undefined) {
+      clauses.push('created_at <= ?');
+      params.push(opts.to);
+    }
+    const where = `WHERE ${clauses.join(' AND ')}`;
+    const byMarket = this.db.all<{
+      market: string;
+      count: number;
+      win: number;
+      lose: number;
+      draw: number;
+      volumeMinor: number;
+      payoutMinor: number;
+    }>(
+      `SELECT market, COUNT(*) AS count,
+              SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) AS win,
+              SUM(CASE WHEN result = 'lose' THEN 1 ELSE 0 END) AS lose,
+              SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END) AS draw,
+              SUM(amount_minor) AS volumeMinor, SUM(payout_minor) AS payoutMinor
+         FROM trades ${where} GROUP BY market ORDER BY count DESC`,
+      ...params,
+    );
+    const byDuration = this.db.all<{
+      durationSec: number;
+      count: number;
+      win: number;
+      lose: number;
+      draw: number;
+      volumeMinor: number;
+      payoutMinor: number;
+    }>(
+      `SELECT duration_sec AS durationSec, COUNT(*) AS count,
+              SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) AS win,
+              SUM(CASE WHEN result = 'lose' THEN 1 ELSE 0 END) AS lose,
+              SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END) AS draw,
+              SUM(amount_minor) AS volumeMinor, SUM(payout_minor) AS payoutMinor
+         FROM trades ${where} GROUP BY duration_sec ORDER BY duration_sec`,
+      ...params,
+    );
+    const num = <T extends Record<string, unknown>>(rows: T[]) =>
+      rows.map((row) => {
+        const out: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(row))
+          out[key] = typeof value === 'bigint' ? Number(value) : (value ?? 0);
+        return out;
+      });
+    return {
+      byMarket: num(byMarket) as unknown as Array<{
+        market: string;
+        count: number;
+        win: number;
+        lose: number;
+        draw: number;
+        volumeMinor: number;
+        payoutMinor: number;
+      }>,
+      byDuration: num(byDuration) as unknown as Array<{
+        durationSec: number;
+        count: number;
+        win: number;
+        lose: number;
+        draw: number;
+        volumeMinor: number;
+        payoutMinor: number;
+      }>,
+    };
   }
 }

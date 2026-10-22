@@ -1,3 +1,4 @@
+import path from 'node:path';
 import 'dotenv/config';
 import { z } from 'zod';
 
@@ -35,7 +36,7 @@ const schema = z.object({
   ARGON2_MEMORY_KIB: int(19456, 8),
   ARGON2_TIME_COST: int(2, 1),
 
-  ADMIN_EMAIL: z.string().email().default('admin@simulator.local'),
+  ADMIN_EMAIL: z.string().email().default('admin@simtrade.local'),
   ADMIN_USERNAME: z.string().min(3).max(32).default('admin'),
   ADMIN_PASSWORD: z.string().min(8).default('admin-demo-123'),
 
@@ -44,6 +45,18 @@ const schema = z.object({
   EXPOSE_DEV_TOKENS: bool(true),
   /** when true, an unverified email blocks trading (default off for the demo) */
   REQUIRE_EMAIL_VERIFICATION: bool(false),
+
+  /** file storage outside the source tree */
+  UPLOADS_DIR: z.string().default('./data/uploads'),
+  MAX_UPLOAD_BYTES: int(524_288, 1024, 5_242_880),
+  BACKUP_DIR: z.string().default('./data/backups'),
+  BACKUP_INTERVAL_MS: int(6 * 3600_000, 60_000),
+  TOTP_ISSUER: z.string().default('SimTrade Demo'),
+  /** CSRF: state-changing requests must echo the CSRF cookie in this header */
+  CSRF_HEADER: z.string().default('x-csrf-token'),
+  CSRF_COOKIE: z.string().default('sim_csrf'),
+  LOGIN_MAX_ATTEMPTS: int(8, 1),
+  LOGIN_LOCK_MIN_MS: int(15 * 60_000, 10_000),
 
   RATE_AUTH_MAX: int(20, 1),
   RATE_AUTH_WINDOW_MS: int(60_000, 1000),
@@ -94,8 +107,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     }
   }
 
+  const absolute = (value: string) => (path.isAbsolute(value) ? value : path.resolve(process.cwd(), value));
+  // `:memory:` must stay verbatim (tests use it); resolving it would create a
+  // literal file called ":memory:" in the working directory.
+  const sqlitePath =
+    e.SQLITE_PATH === ':memory:' || e.SQLITE_PATH.startsWith('file:') ? e.SQLITE_PATH : absolute(e.SQLITE_PATH);
   return {
     ...e,
+    APP_VERSION: process.env.npm_package_version ?? '3.0.0',
+    SQLITE_PATH: sqlitePath,
+    DB_PATH: sqlitePath,
+    DATA_DIR: sqlitePath === ':memory:' ? process.cwd() : path.dirname(sqlitePath),
+    PUBLIC_URL: e.APP_PUBLIC_URL,
+    UPLOADS_DIR: absolute(e.UPLOADS_DIR),
+    BACKUP_DIR: absolute(e.BACKUP_DIR),
     CORS_ORIGINS: e.CORS_ORIGINS.split(',')
       .map((s) => s.trim())
       .filter(Boolean),

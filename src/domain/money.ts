@@ -30,7 +30,12 @@ export function decimalsOf(value: number): number {
  * Converts between demo currencies using admin-configured rates.
  * Rates are expressed as "units of this currency per 1 USD".
  */
-export function convertMinor(amountMinor: number, from: Currency, to: Currency, rates: Record<Currency, number>): number {
+export function convertMinor(
+  amountMinor: number,
+  from: Currency,
+  to: Currency,
+  rates: Record<Currency, number>,
+): number {
   if (from === to) return amountMinor;
   const usd = amountMinor / scaleOf(from) / rates[from];
   const target = Math.round(usd * rates[to] * scaleOf(to));

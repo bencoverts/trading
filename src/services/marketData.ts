@@ -109,15 +109,19 @@ export class MarketDataService {
   // ------------------------------------------------------------- bootstrap
 
   /** Fills an empty database with 24 h of synthetic candles + ticks. */
-  bootstrapHistory(markets: Array<{ symbol: string; basePrice: number; tickSize: number; priceDecimals: number }>): void {
+  bootstrapHistory(
+    markets: Array<{ symbol: string; basePrice: number; tickSize: number; priceDecimals: number }>,
+    opts: { hours?: number; force?: boolean } = {},
+  ): void {
     const now = this.deps.clock.now();
     const endTime = Math.floor(now / 5_000) * 5_000;
     const stepMs = 5_000;
-    const points = (24 * 3600_000) / stepMs; // 17,280 points / market
+    const hours = opts.hours ?? 24;
+    const points = Math.max(120, Math.round((hours * 3600_000) / stepMs));
 
     for (const [index, market] of markets.entries()) {
       const hasCandles = this.db.get<{ t: number }>('SELECT t FROM candles WHERE market = ? LIMIT 1', market.symbol);
-      if (hasCandles) continue;
+      if (hasCandles && !opts.force) continue;
 
       const path = synthPath({
         endPrice: market.basePrice,
@@ -148,6 +152,9 @@ export class MarketDataService {
 
       const last = path[path.length - 1];
       this.deps.engine.setPrice(market.symbol, last.price);
+      // make the new market tradeable immediately (entry price must exist even
+      // when the tick loop is not running yet, e.g. in tests)
+      this.deps.engine.ingest(market.symbol, last.price, last.time + 1);
       this.deps.logger.info({ market: market.symbol, ticks: path.length }, 'synthetic 24h history created');
     }
   }
@@ -178,10 +185,7 @@ export class MarketDataService {
     this.flushTimer.unref?.();
     this.candleTimer = setInterval(() => this.flushRunningCandles(), 2_000);
     this.candleTimer.unref?.();
-    this.housekeepingTimer = setInterval(
-      () => this.prune(),
-      this.deps.config.HOUSEKEEPING_INTERVAL_MS,
-    );
+    this.housekeepingTimer = setInterval(() => this.prune(), this.deps.config.HOUSEKEEPING_INTERVAL_MS);
     this.housekeepingTimer.unref?.();
   }
 
@@ -222,18 +226,19 @@ export class MarketDataService {
   /** Newest persisted ticks (oldest → newest) plus not-yet-flushed ones. */
   recentTicks(market: string, opts: { since?: number; limit?: number } = {}): TickPoint[] {
     const limit = Math.min(Math.max(opts.limit ?? 500, 1), 5_000);
-    const rows = opts.since !== undefined
-      ? this.db.all<{ t: number; price: number }>(
-          'SELECT t, price FROM ticks WHERE market = ? AND t >= ? ORDER BY t DESC LIMIT ?',
-          market,
-          opts.since,
-          limit,
-        )
-      : this.db.all<{ t: number; price: number }>(
-          'SELECT t, price FROM ticks WHERE market = ? ORDER BY t DESC LIMIT ?',
-          market,
-          limit,
-        );
+    const rows =
+      opts.since !== undefined
+        ? this.db.all<{ t: number; price: number }>(
+            'SELECT t, price FROM ticks WHERE market = ? AND t >= ? ORDER BY t DESC LIMIT ?',
+            market,
+            opts.since,
+            limit,
+          )
+        : this.db.all<{ t: number; price: number }>(
+            'SELECT t, price FROM ticks WHERE market = ? ORDER BY t DESC LIMIT ?',
+            market,
+            limit,
+          );
     const persisted = rows.map((r) => ({ time: Number(r.t), price: Number(r.price) })).reverse();
     const lastTime = persisted.length ? persisted[persisted.length - 1].time : -Infinity;
     const pending = this.pendingTicks
@@ -252,9 +257,9 @@ export class MarketDataService {
         'SELECT price FROM ticks WHERE market = ? AND t <= ? ORDER BY t DESC LIMIT 1',
         market,
         target,
-      ) ??
-      this.db.get<{ price: number }>('SELECT price FROM ticks WHERE market = ? ORDER BY t ASC LIMIT 1', market);
-    const price = row ? Number(row.price) : null;
+      ) ?? this.db.get<{ price: number }>('SELECT price FROM ticks WHERE market = ? ORDER BY t ASC LIMIT 1', market);
+    const buffered = this.deps.engine.recentTicks(market, 5_000, now - 24 * 3600_000);
+    const price = row ? Number(row.price) : (buffered[0]?.price ?? null);
     this.tickerCache.set(market, { at: now, price });
     return price;
   }
@@ -268,8 +273,14 @@ export class MarketDataService {
       market,
       now - 24 * 3600_000,
     );
-    const high = row?.hi === null || row?.hi === undefined ? null : Number(row.hi);
-    const low = row?.lo === null || row?.lo === undefined ? null : Number(row.lo);
+    let high = row?.hi === null || row?.hi === undefined ? null : Number(row.hi);
+    let low = row?.lo === null || row?.lo === undefined ? null : Number(row.lo);
+    // fall back to the in-memory buffer when ticks have not been flushed yet
+    const buffered = this.deps.engine.recentTicks(market, 5_000, now - 24 * 3600_000);
+    for (const tick of buffered) {
+      high = high === null ? tick.price : Math.max(high, tick.price);
+      low = low === null ? tick.price : Math.min(low, tick.price);
+    }
     this.rangeCache.set(market, { at: now, high, low });
     return { high, low };
   }
@@ -301,24 +312,29 @@ export class MarketDataService {
   }
 
   /** Candle history for the API: persisted closed candles + forming candle. */
-  candles(market: string, tf: string, opts: { limit: number; before?: number; includeCurrent: boolean }): {
+  candles(
+    market: string,
+    tf: string,
+    opts: { limit: number; before?: number; includeCurrent: boolean },
+  ): {
     candles: Candle[];
     current: Candle | null;
   } {
-    const rows = opts.before === undefined
-      ? this.db.all<CandleRow>(
-          `SELECT t, o, h, l, c FROM candles WHERE market = ? AND tf = ? ORDER BY t DESC LIMIT ?`,
-          market,
-          tf,
-          opts.limit,
-        )
-      : this.db.all<CandleRow>(
-          `SELECT t, o, h, l, c FROM candles WHERE market = ? AND tf = ? AND t < ? ORDER BY t DESC LIMIT ?`,
-          market,
-          tf,
-          opts.before,
-          opts.limit,
-        );
+    const rows =
+      opts.before === undefined
+        ? this.db.all<CandleRow>(
+            `SELECT t, o, h, l, c FROM candles WHERE market = ? AND tf = ? ORDER BY t DESC LIMIT ?`,
+            market,
+            tf,
+            opts.limit,
+          )
+        : this.db.all<CandleRow>(
+            `SELECT t, o, h, l, c FROM candles WHERE market = ? AND tf = ? AND t < ? ORDER BY t DESC LIMIT ?`,
+            market,
+            tf,
+            opts.before,
+            opts.limit,
+          );
     const candles = rows.map((r) => ({ t: Number(r.t), o: r.o, h: r.h, l: r.l, c: r.c })).reverse();
     // Paging backwards must return only closed candles: the forming candle has a
     // timestamp newer than `before` and would otherwise break pagination.
@@ -339,7 +355,10 @@ export class MarketDataService {
     const { config } = this.deps;
     const ticks = this.db.run('DELETE FROM ticks WHERE t < ?', now - config.TICK_RETENTION_DAYS * 86_400_000);
     const candles = this.db.run('DELETE FROM candles WHERE t < ?', now - config.CANDLE_RETENTION_DAYS * 86_400_000);
-    const audit = this.db.run('DELETE FROM audit_log WHERE created_at < ?', now - config.AUDIT_RETENTION_DAYS * 86_400_000);
+    const audit = this.db.run(
+      'DELETE FROM audit_log WHERE created_at < ?',
+      now - config.AUDIT_RETENTION_DAYS * 86_400_000,
+    );
     const tokens = this.db.run('DELETE FROM email_tokens WHERE expires_at < ?', now - 7 * 86_400_000);
     this.tickerCache.clear();
     this.rangeCache.clear();

@@ -10,3 +10,9 @@ coverage/
 *.log
 .DS_Store
 .vitest/
+
+data/uploads/
+data/backups/
+playwright-report/
+test-results/
+*.tsbuildinfo

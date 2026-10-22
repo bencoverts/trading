@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -8,19 +9,27 @@ import { pinoHttp } from 'pino-http';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import type { AppContext } from '../app/context.js';
 import { AppError } from '../lib/errors.js';
-import { createAuthMiddleware } from '../auth/middleware.js';
+import { can, permissionsFor, type Permission } from '../auth/permissions.js';
 import { marketRoutes } from '../routes/market.js';
 import { authRoutes } from '../routes/auth.js';
 import { accountRoutes } from '../routes/account.js';
 import { tradeRoutes } from '../routes/trades.js';
 import { adminRoutes } from '../routes/admin.js';
 import { paymentRoutes } from '../routes/payments.js';
+import { contentRoutes } from '../routes/content.js';
+import { csrfGuard, ensureCsrfCookie, requireAuth, sessionMiddleware, type AuthedRequest } from './session.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(here, '..', '..', 'public');
 
+/**
+ * HTTP application: security headers, strict CORS, cookie sessions + CSRF,
+ * versioned API, static SPA shell and a single JSON error handler.
+ */
 export function createApp(ctx: AppContext): express.Express {
   const { config, logger } = ctx;
+  fs.mkdirSync(config.UPLOADS_DIR, { recursive: true });
+
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.TRUST_PROXY ? 1 : false);
@@ -32,8 +41,9 @@ export function createApp(ctx: AppContext): express.Express {
         directives: {
           defaultSrc: ["'self'"],
           scriptSrc: ["'self'"],
-          styleSrc: ["'self'"],
-          imgSrc: ["'self'", 'data:'],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          imgSrc: ["'self'", 'data:', 'blob:'],
+          fontSrc: ["'self'", 'data:'],
           connectSrc: ["'self'", 'ws:', 'wss:'],
           objectSrc: ["'none'"],
           baseUri: ["'self'"],
@@ -50,12 +60,6 @@ export function createApp(ctx: AppContext): express.Express {
     }),
   );
 
-  /**
-   * Strict CORS: an origin is allowed when it is listed in CORS_ORIGINS or when
-   * its host equals the request host (same-origin behind a reverse proxy or a
-   * preview domain). Anything else gets no CORS headers at all - the origin is
-   * never reflected blindly.
-   */
   const hostOf = (value: string): string | null => {
     try {
       return new URL(value).host;
@@ -65,6 +69,11 @@ export function createApp(ctx: AppContext): express.Express {
   };
   const allowedOrigins = new Set(config.CORS_ORIGINS.map(hostOf).filter((h): h is string => Boolean(h)));
 
+  /**
+   * Same-origin requests (including proxied preview domains) are allowed; extra
+   * origins must be listed explicitly in CORS_ORIGINS. Everything else receives
+   * no CORS headers at all.
+   */
   app.use((req, res, next) => {
     const requestOrigin = req.header('origin');
     const allow = (origin: string) => {
@@ -81,19 +90,23 @@ export function createApp(ctx: AppContext): express.Express {
         return callback(null, allow(requestOrigin));
       },
       credentials: true,
-      methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+      methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', config.CSRF_HEADER],
       exposedHeaders: ['Idempotency-Key', 'Idempotent-Replayed'],
       maxAge: 600,
     })(req, res, next);
   });
 
   app.use(cookieParser());
+  app.use(express.json({ limit: '256kb' }));
   app.use(
     pinoHttp({
       logger,
-      autoLogging: { ignore: (req) => req.url === '/healthz' || Boolean(req.url?.startsWith('/assets')) },
-      customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
+      autoLogging: {
+        ignore: (req) => req.url === '/healthz' || Boolean(req.url?.startsWith('/assets')),
+      },
+      customLogLevel: (_req, res, err) =>
+        err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
       serializers: {
         req: (req: { method?: string; url?: string; remoteAddress?: string }) => ({
           method: req.method,
@@ -105,7 +118,21 @@ export function createApp(ctx: AppContext): express.Express {
     }),
   );
 
-  const { requireAuth, requireAdmin } = createAuthMiddleware(ctx.tokens, ctx.users);
+  app.use(sessionMiddleware(ctx));
+
+  const requireStaff =
+    (...needed: Permission[]): express.RequestHandler =>
+    (req, _res, next) => {
+      const auth = (req as AuthedRequest).auth;
+      if (!auth) return next(AppError.unauthorized('Silakan masuk terlebih dahulu'));
+      if (!auth.role) return next(AppError.forbidden('Akses khusus staf'));
+      for (const permission of needed) {
+        if (!can(auth.role, permission)) {
+          return next(AppError.forbidden(`Role ${auth.role} tidak punya izin ${permission}`));
+        }
+      }
+      return next();
+    };
 
   app.get('/healthz', (_req, res) => {
     let dbOk = true;
@@ -123,74 +150,96 @@ export function createApp(ctx: AppContext): express.Express {
     res.status(dbOk ? 200 : 503).json({
       status: dbOk ? 'ok' : 'degraded',
       simulation: true,
+      label: 'SIMULASI',
       serverTime: ctx.clock.now(),
       uptimeSec: Math.round(process.uptime()),
       db: dbOk ? 'ok' : 'error',
       dbDriver: ctx.db.driver,
       markets,
       realtime: { connections: ctx.realtime?.connectionCount ?? 0 },
-      version: process.env.npm_package_version ?? '2.0.0',
+      jobs: ctx.jobs.status().map((job) => ({ name: job.name, status: job.lastStatus, stale: job.stale })),
+      version: config.APP_VERSION,
     });
   });
 
   // --------------------------------------------------------------- API v1
   const api = express.Router();
-  api.use(express.json({ limit: '64kb' }));
+  api.use(csrfGuard(ctx));
 
-  const limiter = (
-    windowMs: number,
-    limit: number,
-    message: string,
-    keyGenerator?: (req: Request) => string,
-  ) =>
+  // every safe request hands the SPA a fresh double-submit CSRF cookie
+  api.use((req, res, next) => {
+    if (['GET', 'HEAD'].includes(req.method)) ensureCsrfCookie(ctx, req, res);
+    next();
+  });
+
+  const limiter = (windowMs: number, limit: number, message: string, keyGenerator?: (req: Request) => string) =>
     rateLimit({
       windowMs,
-      limit,
+      limit: config.isTest ? limit * 100 : limit,
       standardHeaders: 'draft-7',
       legacyHeaders: false,
       passOnStoreError: true,
       keyGenerator,
-      handler: (_req, res) =>
-        res.status(429).json({ error: { code: 'RATE_LIMITED', message } }),
+      handler: (_req, res) => res.status(429).json({ error: { code: 'RATE_LIMITED', message } }),
     });
 
   const globalLimiter = limiter(config.RATE_GLOBAL_WINDOW_MS, config.RATE_GLOBAL_MAX, 'Too many requests');
-  const authLimiter = limiter(config.RATE_AUTH_WINDOW_MS, config.RATE_AUTH_MAX, 'Too many authentication attempts');
+  const authLimiter = limiter(
+    config.RATE_AUTH_WINDOW_MS,
+    ctx.settings.get().loginRateLimitPerMin,
+    'Terlalu banyak percobaan. Coba lagi nanti.',
+  );
   const tradeLimiter = limiter(
     config.RATE_TRADE_WINDOW_MS,
-    config.RATE_TRADE_MAX,
-    'Too many trade requests',
-    (req) => req.auth?.userId ?? ipKeyGenerator(req.ip ?? ''),
+    ctx.settings.get().tradeRateLimitPerMin,
+    'Terlalu banyak permintaan trade',
+    (req) => (req as AuthedRequest).auth?.userId ?? ipKeyGenerator(req.ip ?? ''),
   );
 
   api.use(globalLimiter);
   api.use(marketRoutes(ctx));
-  api.use('/auth', authLimiter, authRoutes(ctx, requireAuth));
-  api.use(accountRoutes(ctx, requireAuth));
-  api.use(tradeRoutes(ctx, requireAuth, tradeLimiter));
-  api.use('/admin', requireAdmin, adminRoutes(ctx, requireAdmin));
+  api.use(contentRoutes(ctx));
+  api.use('/auth', authLimiter, authRoutes(ctx));
+  const optionalAuth: express.RequestHandler = (_req, _res, next) => next();
+  api.use(accountRoutes(ctx, requireAuth as never, optionalAuth));
+  api.use(tradeRoutes(ctx, requireAuth as never, tradeLimiter));
+  api.use('/admin', requireStaff(), adminRoutes(ctx, requireStaff));
   api.use(paymentRoutes(ctx));
-
   api.use((_req, _res, next) => next(AppError.notFound('Unknown API endpoint')));
 
   app.use('/api/v1', api);
 
   // ------------------------------------------------------------- static UI
+  const staticOptions = {
+    index: 'index.html',
+    setHeaders: (res: Response, filePath: string) => {
+      if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
+      if (filePath.endsWith('.js') || filePath.endsWith('.css')) res.setHeader('Cache-Control', 'public, max-age=300');
+    },
+  };
+
+  app.use(express.static(publicDir, staticOptions));
+
+  // uploaded images live outside the source tree and are served read-only
   app.use(
-    express.static(publicDir, {
-      index: 'index.html',
-      extensions: ['html'],
-      setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
+    '/uploads',
+    express.static(config.UPLOADS_DIR, {
+      index: false,
+      dotfiles: 'deny',
+      maxAge: '7d',
+      setHeaders: (res) => {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
       },
     }),
   );
 
-  // SPA routes
-  const appShell = (_req: Request, res: Response) => res.sendFile(path.join(publicDir, 'index.html'));
-  for (const route of ['/login', '/register', '/forgot-password', '/reset-password', '/verify-email', '/trading', '/account', '/admin']) {
-    app.get(route, appShell);
-  }
+  // SPA shell: any extension-less GET is handled by the client router
+  app.get('*', (req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return next();
+    if (path.extname(req.path)) return next();
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
 
   // --------------------------------------------------------------- errors
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
@@ -201,7 +250,7 @@ export function createApp(ctx: AppContext): express.Express {
       });
       return;
     }
-    const e = err as { type?: string; status?: number };
+    const e = err as { type?: string; status?: number; code?: string };
     if (e?.type === 'entity.parse.failed') {
       res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Malformed JSON body' } });
       return;
@@ -210,9 +259,14 @@ export function createApp(ctx: AppContext): express.Express {
       res.status(413).json({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body too large' } });
       return;
     }
+    if (e?.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ error: { code: 'UPLOAD_INVALID', message: 'Ukuran file terlalu besar' } });
+      return;
+    }
     logger.error({ err, url: req.url }, 'unhandled request error');
     res.status(500).json({ error: { code: 'INTERNAL', message: 'Internal server error' } });
   });
 
+  void permissionsFor;
   return app;
 }

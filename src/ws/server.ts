@@ -5,6 +5,9 @@ import type { Logger } from '../lib/logger.js';
 import type { PriceEngine } from '../price/engine.js';
 import type { TokenService } from '../auth/tokens.js';
 import type { UserService } from '../services/users.js';
+import type { AccountService } from '../auth/accounts.js';
+import type { MarketService } from '../services/markets.js';
+import { parseTradingHours, isMarketOpen } from '../domain/marketSchedule.js';
 import { clientMessageSchema, type ServerMessage } from './protocol.js';
 import { TIMEFRAME_LIST } from '../domain/constants.js';
 
@@ -31,6 +34,8 @@ export interface RealtimeServerOptions {
   engine: PriceEngine;
   tokens: TokenService;
   users: UserService;
+  accounts: AccountService;
+  markets: MarketService;
   path?: string;
 }
 
@@ -50,6 +55,7 @@ export class RealtimeServer {
   private readonly unsubscribers: Array<() => void> = [];
   private nextId = 1;
   private closing = false;
+  private droppedConnections = 0;
 
   constructor(private readonly opts: RealtimeServerOptions) {
     this.wss = new WebSocketServer({
@@ -86,7 +92,7 @@ export class RealtimeServer {
         }
       }),
       opts.engine.events.on('candle_closed', ({ market, tf, candle, seq }) => {
-        const message: ServerMessage = { type: 'candle_closed', market, tf, candle, seq };
+        const message: ServerMessage = { type: 'candle_closed', market, symbol: market, tf, candle, seq };
         for (const client of this.clients) {
           if (client.subscriptions.has(this.key(market, tf))) this.send(client, message);
         }
@@ -96,6 +102,36 @@ export class RealtimeServer {
 
   get connectionCount(): number {
     return this.clients.size;
+  }
+
+  /** Connections lost in the last 10 minutes (used by the admin alerts). */
+  get recentDrops(): number {
+    return this.droppedConnections;
+  }
+
+  /** Broadcast a market status change to every subscribed client. */
+  broadcastMarketStatus(symbol: string): void {
+    const row = this.opts.markets.row(symbol);
+    if (!row) return;
+    const state = isMarketOpen(parseTradingHours(row.trading_hours), Date.now());
+    const status =
+      row.deleted_at || row.active !== 1 ? 'inactive' : row.paused === 1 ? 'paused' : state.open ? 'active' : 'closed';
+    const message: ServerMessage = {
+      type: 'market_status',
+      market: row.symbol,
+      status,
+      paused: row.paused === 1,
+      open: state.open,
+      reason: state.open ? null : (state.reason ?? null),
+      serverTime: Date.now(),
+    };
+    for (const client of this.clients) {
+      if (client.markets.has(row.symbol) || client.subscriptions.size === 0) this.send(client, message);
+    }
+  }
+
+  sendToAll(message: ServerMessage): void {
+    for (const client of this.clients) this.send(client, message);
   }
 
   sendToUser(userId: string, message: ServerMessage): void {
@@ -140,7 +176,8 @@ export class RealtimeServer {
     if (token) {
       const payload = this.opts.tokens.verify(token);
       const user = payload ? this.opts.users.findById(payload.sub) : undefined;
-      if (payload && user && user.token_version === payload.v && !user.blocked_at) {
+      const session = payload ? this.opts.accounts.active(payload.sid) : undefined;
+      if (payload && user && user.token_version === payload.v && !user.blocked_at && session) {
         userId = user.id;
         role = user.role;
       }
@@ -174,13 +211,28 @@ export class RealtimeServer {
       type: 'hello',
       serverTime: Date.now(),
       simulation: true,
-      markets: this.opts.engine.listConfigs().map((m) => ({
-        symbol: m.symbol,
-        name: m.name,
-        lastSeq: this.opts.engine.lastSeq(m.symbol),
-        paused: m.paused,
-        priceDecimals: m.priceDecimals,
-      })),
+      label: 'SIMULASI',
+      markets: this.opts.engine.listConfigs().map((m) => {
+        const row = this.opts.markets.row(m.symbol);
+        const open = row ? isMarketOpen(parseTradingHours(row.trading_hours), Date.now()).open : true;
+        return {
+          symbol: m.symbol,
+          name: m.name,
+          lastSeq: this.opts.engine.lastSeq(m.symbol),
+          paused: m.paused,
+          open,
+          priceDecimals: m.priceDecimals,
+          status: row
+            ? row.paused === 1
+              ? 'paused'
+              : row.active !== 1
+                ? 'inactive'
+                : open
+                  ? 'active'
+                  : 'closed'
+            : 'unknown',
+        };
+      }),
       timeframes: TIMEFRAME_LIST,
       authenticated: Boolean(userId),
       userId,
@@ -199,6 +251,7 @@ export class RealtimeServer {
   private drop(client: ClientState): void {
     if (client.closed) return;
     client.closed = true;
+    if (!this.closing) this.droppedConnections += 1;
     this.clients.delete(client);
     if (client.userId) {
       const set = this.byUser.get(client.userId);
@@ -241,7 +294,8 @@ export class RealtimeServer {
         return this.send(client, { type: 'pong', id: msg.id, serverTime: Date.now() });
 
       case 'subscribe': {
-        const market = msg.market.toUpperCase();
+        const requested = msg.symbol ?? msg.market ?? '';
+        const market = requested.toUpperCase();
         if (!this.opts.engine.has(market)) {
           return this.send(client, { type: 'error', code: 'MARKET_NOT_FOUND', message: `Unknown market: ${market}` });
         }
@@ -253,13 +307,18 @@ export class RealtimeServer {
           });
         }
         if (client.subscriptions.size >= this.opts.config.WS_MAX_SUBSCRIPTIONS) {
-          return this.send(client, { type: 'error', code: 'TOO_MANY_SUBSCRIPTIONS', message: 'Subscription limit reached' });
+          return this.send(client, {
+            type: 'error',
+            code: 'TOO_MANY_SUBSCRIPTIONS',
+            message: 'Subscription limit reached',
+          });
         }
         client.subscriptions.add(this.key(market, msg.timeframe));
         client.markets.add(market);
         this.send(client, {
           type: 'subscribed',
           market,
+          symbol: market,
           timeframe: msg.timeframe,
           snapshot: {
             lastPrice: this.opts.engine.lastPrice(market),
@@ -270,7 +329,14 @@ export class RealtimeServer {
       }
 
       case 'unsubscribe': {
-        const market = msg.market.toUpperCase();
+        const market = (msg.symbol ?? msg.market ?? '').toUpperCase();
+        if (!msg.timeframe) {
+          for (const key of [...client.subscriptions]) {
+            if (key.startsWith(`${market}|`)) client.subscriptions.delete(key);
+          }
+          client.markets.delete(market);
+          return;
+        }
         client.subscriptions.delete(this.key(market, msg.timeframe));
         if (![...client.subscriptions].some((k) => k.startsWith(`${market}|`))) client.markets.delete(market);
         return;
@@ -279,7 +345,8 @@ export class RealtimeServer {
       case 'auth': {
         const payload = this.opts.tokens.verify(msg.token);
         const user = payload ? this.opts.users.findById(payload.sub) : undefined;
-        if (!payload || !user || user.token_version !== payload.v || user.blocked_at) {
+        const session = payload ? this.opts.accounts.active(payload.sid) : undefined;
+        if (!payload || !user || user.token_version !== payload.v || user.blocked_at || !session) {
           return this.send(client, { type: 'error', code: 'UNAUTHORIZED', message: 'Invalid session' });
         }
         if (client.userId) this.byUser.get(client.userId)?.delete(client);
@@ -290,12 +357,15 @@ export class RealtimeServer {
           type: 'hello',
           serverTime: Date.now(),
           simulation: true,
+          label: 'SIMULASI',
           markets: this.opts.engine.listConfigs().map((m) => ({
             symbol: m.symbol,
             name: m.name,
             lastSeq: this.opts.engine.lastSeq(m.symbol),
             paused: m.paused,
+            open: true,
             priceDecimals: m.priceDecimals,
+            status: m.paused ? 'paused' : 'active',
           })),
           timeframes: TIMEFRAME_LIST,
           authenticated: true,
@@ -307,7 +377,7 @@ export class RealtimeServer {
       }
 
       case 'resume': {
-        const market = msg.market.toUpperCase();
+        const market = (msg.symbol ?? msg.market ?? '').toUpperCase();
         if (!this.opts.engine.has(market)) {
           return this.send(client, { type: 'error', code: 'MARKET_NOT_FOUND', message: `Unknown market: ${market}` });
         }
@@ -315,6 +385,7 @@ export class RealtimeServer {
           return this.send(client, {
             type: 'resync',
             market,
+            symbol: market,
             reason: 'seq_too_old',
             seq: this.opts.engine.lastSeq(market),
           });
@@ -322,6 +393,7 @@ export class RealtimeServer {
         this.send(client, {
           type: 'replay',
           market,
+          symbol: market,
           fromSeq: msg.lastSeq,
           seq: this.opts.engine.lastSeq(market),
           ticks: this.opts.engine.ticksSince(market, msg.lastSeq, 1_000).map((t) => ({
@@ -344,7 +416,7 @@ export class RealtimeServer {
     for (const client of this.clients) {
       if (client.ws.readyState !== WebSocket.OPEN) continue;
       for (const [market, tick] of client.pendingTicks) {
-        this.send(client, { type: 'tick', market, price: tick.price, time: tick.time, seq: tick.seq });
+        this.send(client, { type: 'tick', market, symbol: market, price: tick.price, time: tick.time, seq: tick.seq });
       }
       client.pendingTicks.clear();
       for (const [key, candle] of client.pendingCandles) {
@@ -352,6 +424,7 @@ export class RealtimeServer {
         this.send(client, {
           type: 'candle',
           market,
+          symbol: market,
           tf: candle.tf,
           t: candle.t,
           o: candle.o,

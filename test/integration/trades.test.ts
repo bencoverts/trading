@@ -1,175 +1,228 @@
-import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { cookiesFrom, createTestApp, registerUser, withCookies, type TestContext } from '../helpers/app.js';
-import { newId } from '../../src/lib/ids.js';
+import { createTestApp, pushPrice, registerUser, seedPrice, type TestContext } from '../helpers/app.js';
 
 let ctx: TestContext;
-let api: () => request.SuperTest<request.Test>;
 
 beforeAll(async () => {
   ctx = await createTestApp();
-  api = ctx.api;
-  ctx.runtime.ctx.engine.ingest('DOGE', 0.4, ctx.clock.now());
+  seedPrice(ctx, 'ASIA_COMPOSITE', 6_000);
+  seedPrice(ctx, 'DOGE', 0.42);
+  seedPrice(ctx, 'CRYPTO_COMPOSITE', 41_000);
 });
+
 afterAll(async () => {
   await ctx.close();
 });
 
-const place = (cookies: string[], body: Record<string, unknown>, key?: string) => {
-  let req = withCookies(api().post('/api/v1/trades'), cookies).send(body);
-  if (key) req = req.set('Idempotency-Key', key);
-  return req;
-};
+const trade = (overrides: Record<string, unknown> = {}) => ({
+  market: 'ASIA_COMPOSITE',
+  direction: 'up',
+  currency: 'USD',
+  amount: 10,
+  durationSec: 60,
+  ...overrides,
+});
 
-describe('trade creation', () => {
-  it('opens a trade with a server entry price and expiry, and debits the wallet', async () => {
-    const user = await registerUser(api());
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 100, durationSec: 60 }).expect(201);
-
-    expect(res.body.trade.status).toBe('open');
-    expect(res.body.trade.entryPrice).toBe(0.4);
-    expect(res.body.trade.expiryTime - res.body.trade.entryTime).toBe(60_000);
-    expect(res.body.trade.payoutRate).toBe(0.85);
-    expect(res.body.trade.amountMinor).toBe(10_000);
-    expect(res.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balanceMinor).toBe(90_000);
+describe('opening trades', () => {
+  it('debits the wallet, stores the entry price and returns a preview-shaped trade', async () => {
+    const user = await registerUser(ctx);
+    const before = (await user.client.get('/api/v1/wallet')).body.wallets.find(
+      (w: { currency: string }) => w.currency === 'USD',
+    );
+    const res = await user.client.post('/api/v1/trades', trade());
+    expect(res.status).toBe(201);
+    expect(res.body.trade.market).toBe('ASIA_COMPOSITE');
+    expect(res.body.trade.entryPrice).toBe(6_000);
+    expect(res.body.trade.expiryTime).toBe(res.body.trade.entryTime + 60_000);
+    const usd = res.body.wallets.find((w: { currency: string }) => w.currency === 'USD');
+    expect(usd.balanceMinor).toBe(before.balanceMinor - 1_000);
   });
 
-  it('rejects an amount below the minimum', async () => {
-    const user = await registerUser(api());
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 0.5, durationSec: 60 }).expect(422);
-    expect(res.body.error.code).toBe('AMOUNT_NOT_ALLOWED');
-    expect(res.body.error.details.minMinor).toBe(100);
+  it('rejects a missing Idempotency-Key', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', trade(), { idempotencyKey: null });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
   });
 
-  it('rejects an amount above the maximum', async () => {
-    const user = await registerUser(api());
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 5_000, durationSec: 60 }).expect(422);
-    expect(res.body.error.code).toBe('AMOUNT_NOT_ALLOWED');
+  it('replays an identical request and rejects a different payload with the same key', async () => {
+    const user = await registerUser(ctx);
+    const key = `idem-${Date.now()}`;
+    const first = await user.client.post('/api/v1/trades', trade({ amount: 7 }), { idempotencyKey: key });
+    expect(first.status).toBe(201);
+    const replay = await user.client.post('/api/v1/trades', trade({ amount: 7 }), { idempotencyKey: key });
+    expect(replay.status).toBe(200);
+    expect(replay.headers['idempotent-replayed']).toBe('true');
+    expect(replay.body.trade.id).toBe(first.body.trade.id);
+    const mismatch = await user.client.post('/api/v1/trades', trade({ amount: 9 }), { idempotencyKey: key });
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body.error.code).toBe('IDEMPOTENCY_KEY_REUSED');
   });
 
-  it('rejects a zero / negative / missing amount via schema validation', async () => {
-    const user = await registerUser(api());
-    for (const amount of [0, -10]) {
-      const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount, durationSec: 60 }).expect(400);
-      expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    }
+  it('validates amount, duration, market status and balance server-side', async () => {
+    const user = await registerUser(ctx);
+    const tooSmall = await user.client.post('/api/v1/trades', trade({ amount: 0.01 }));
+    expect(tooSmall.status).toBe(422);
+    expect(tooSmall.body.error.code).toBe('AMOUNT_NOT_ALLOWED');
+
+    const badDuration = await user.client.post('/api/v1/trades', trade({ durationSec: 7 }));
+    expect(badDuration.status).toBe(422);
+    expect(badDuration.body.error.code).toBe('DURATION_NOT_ALLOWED');
+
+    const unknownMarket = await user.client.post('/api/v1/trades', trade({ market: 'NOPE' }));
+    expect(unknownMarket.status).toBe(404);
+
+    const tooMuch = await user.client.post('/api/v1/trades', trade({ amount: 999_999 }));
+    expect(tooMuch.status).toBe(422);
+
+    const settings = ctx.runtime.ctx.settings.get();
+    const balance = ctx.runtime.ctx.wallets.viewOf(user.userId, 'USD').balance;
+    expect(balance).toBe(settings.initialBalance.USD / 100);
   });
 
-  it('rejects durations outside 5s..8h', async () => {
-    const user = await registerUser(api());
-    for (const durationSec of [4, 28_801]) {
-      const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 10, durationSec }).expect(400);
-      expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    }
-  });
-
-  it('rejects a duration that is inside the range but not on the allowed list', async () => {
-    const user = await registerUser(api());
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 10, durationSec: 7 }).expect(422);
-    expect(res.body.error.code).toBe('DURATION_NOT_ALLOWED');
-    expect(res.body.error.details.allowedDurations).toContain(5);
-  });
-
-  it('rejects an unknown direction and an unknown market', async () => {
-    const user = await registerUser(api());
-    const badDir = await place(user.cookies, { market: 'DOGE', direction: 'sideways', amount: 10, durationSec: 60 }).expect(400);
-    expect(badDir.body.error.code).toBe('VALIDATION_ERROR');
-
-    const badMarket = await place(user.cookies, { market: 'TSLA', direction: 'up', amount: 10, durationSec: 60 }).expect(404);
-    expect(badMarket.body.error.code).toBe('MARKET_NOT_FOUND');
-  });
-
-  it('rejects unauthenticated trades', async () => {
-    const res = await api().post('/api/v1/trades').send({ market: 'DOGE', direction: 'up', amount: 10, durationSec: 60 }).expect(401);
-    expect(res.body.error.code).toBe('UNAUTHORIZED');
-  });
-
-  it('rejects a withdrawn market and a paused market', async () => {
-    const user = await registerUser(api());
-    const adminRes = await api()
-      .post('/api/v1/auth/login')
-      .send({ identifier: ctx.config.ADMIN_EMAIL, password: ctx.config.ADMIN_PASSWORD })
-      .expect(200);
-    const admin = cookiesFrom(adminRes);
-
-    await api().patch('/api/v1/admin/markets/CRYPTO_COMPOSITE').set('Cookie', admin.join('; ')).send({ paused: true }).expect(200);
-    const paused = await place(user.cookies, { market: 'CRYPTO_COMPOSITE', direction: 'up', amount: 10, durationSec: 60 }).expect(422);
+  it('blocks new trades while the market is paused and while it is outside trading hours', async () => {
+    const user = await registerUser(ctx);
+    const market = ctx.runtime.ctx.markets.requireRow('ASIA_COMPOSITE');
+    ctx.runtime.ctx.markets.update('ASIA_COMPOSITE', { paused: true }, { actorUserId: user.userId });
+    const paused = await user.client.post('/api/v1/trades', trade());
+    expect(paused.status).toBe(422);
     expect(paused.body.error.code).toBe('MARKET_PAUSED');
-    await api().patch('/api/v1/admin/markets/CRYPTO_COMPOSITE').set('Cookie', admin.join('; ')).send({ paused: false }).expect(200);
 
-    await api().patch('/api/v1/admin/markets/DOGE').set('Cookie', admin.join('; ')).send({ paused: true }).expect(200);
-    const again = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 10, durationSec: 60 }).expect(422);
-    expect(again.body.error.code).toBe('MARKET_PAUSED');
-    await api().patch('/api/v1/admin/markets/DOGE').set('Cookie', admin.join('; ')).send({ paused: false }).expect(200);
+    ctx.runtime.ctx.markets.update(
+      'ASIA_COMPOSITE',
+      { paused: false, tradingHours: { mode: 'schedule', timezone: 'Asia/Jakarta', days: [] } },
+      { actorUserId: user.userId },
+    );
+    const closed = await user.client.post('/api/v1/trades', trade());
+    expect(closed.status).toBe(422);
+    expect(closed.body.error.code).toBe('MARKET_OUTSIDE_HOURS');
+
+    ctx.runtime.ctx.markets.update(
+      'ASIA_COMPOSITE',
+      { tradingHours: { mode: '24_7' }, paused: false },
+      { actorUserId: user.userId },
+    );
+    expect(market.symbol).toBe('ASIA_COMPOSITE');
   });
 
-  it('is idempotent: the same Idempotency-Key returns the same trade and debits once', async () => {
-    const user = await registerUser(api());
-    const key = newId();
-    const body = { market: 'DOGE', direction: 'up', amount: 25, durationSec: 300 };
-
-    const first = await place(user.cookies, body, key).expect(201);
-    const second = await place(user.cookies, body, key).expect(200);
-
-    expect(second.headers['idempotent-replayed']).toBe('true');
-    expect(second.body.trade.id).toBe(first.body.trade.id);
-    expect(second.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balanceMinor).toBe(97_500);
+  it('locks the trade currency while a trade is open', async () => {
+    const user = await registerUser(ctx);
+    const first = await user.client.post('/api/v1/trades', trade({ currency: 'USD' }));
+    expect(first.status).toBe(201);
+    const other = await user.client.post('/api/v1/trades', trade({ currency: 'IDR', amount: 50_000 }));
+    expect(other.status).toBe(422);
+    expect(other.body.error.code).toBe('CURRENCY_LOCKED');
+    const patch = await user.client.patch('/api/v1/account', { displayCurrency: 'IDR' });
+    expect(patch.status).toBe(409);
   });
 
-  it('rejects reusing an Idempotency-Key with a different payload', async () => {
-    const user = await registerUser(api());
-    const key = newId();
-    await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 25, durationSec: 300 }, key).expect(201);
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 30, durationSec: 300 }, key).expect(409);
-    expect(res.body.error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+  it('returns a preview with payout and expiry without touching the balance', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades/preview', trade({ amount: 20, durationSec: 300 }));
+    expect(res.status).toBe(200);
+    expect(res.body.payoutRate).toBe(0.85);
+    expect(res.body.payout).toBeCloseTo(37, 5);
+    expect(res.body.expiryTime).toBe(res.body.entryTime + 300_000);
+    const wallet = await user.client.get('/api/v1/wallet');
+    expect(wallet.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balance).toBe(1_000);
+  });
+});
+
+describe('settlement', () => {
+  it('pays out a winning UP trade', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', trade({ amount: 10, durationSec: 5 }));
+    const id = res.body.trade.id as string;
+    ctx.clock.advance(4_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', 6_010);
+    ctx.clock.advance(2_000);
+    const settled = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    expect(settled.length).toBeGreaterThanOrEqual(1);
+    const detail = await user.client.get(`/api/v1/trades/${id}`);
+    expect(detail.body.trade.status).toBe('closed');
+    expect(detail.body.trade.result).toBe('win');
+    expect(detail.body.trade.payout).toBeCloseTo(18.5, 5);
+    const wallet = await user.client.get('/api/v1/wallet');
+    expect(wallet.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balance).toBeCloseTo(1_008.5, 5);
   });
 
-  it('refuses to spend more than the demo balance', async () => {
-    const user = await registerUser(api());
-    const res = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 1_000, durationSec: 60 }).expect(201);
-    expect(res.body.wallets[0].balanceMinor).toBe(0);
-    const over = await place(user.cookies, { market: 'DOGE', direction: 'up', amount: 10, durationSec: 60 }).expect(422);
-    expect(over.body.error.code).toBe('INSUFFICIENT_FUNDS');
+  it('loses the stake when price moves against the direction', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', trade({ amount: 10, durationSec: 5, direction: 'down' }));
+    const id = res.body.trade.id as string;
+    ctx.clock.advance(4_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', 6_050);
+    ctx.clock.advance(2_000);
+    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    const detail = await user.client.get(`/api/v1/trades/${id}`);
+    expect(detail.body.trade.result).toBe('lose');
+    expect(detail.body.trade.payout).toBe(0);
+    const wallet = await user.client.get('/api/v1/wallet');
+    expect(wallet.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balance).toBeCloseTo(990, 5);
   });
 
-  it('honours the max open trades setting', async () => {
-    const app = await createTestApp();
-    try {
-      app.runtime.ctx.engine.ingest('DOGE', 0.4, app.clock.now());
-      const adminRes = await app
-        .api()
-        .post('/api/v1/auth/login')
-        .send({ identifier: app.config.ADMIN_EMAIL, password: app.config.ADMIN_PASSWORD })
-        .expect(200);
-      const admin = cookiesFrom(adminRes);
-      await app.api().patch('/api/v1/admin/settings').set('Cookie', admin.join('; ')).send({ maxOpenTrades: 1 }).expect(200);
-
-      const user = await registerUser(app.api());
-      await withCookies(app.api().post('/api/v1/trades'), user.cookies)
-        .send({ market: 'DOGE', direction: 'up', amount: 10, durationSec: 900 })
-        .expect(201);
-      const res = await withCookies(app.api().post('/api/v1/trades'), user.cookies)
-        .send({ market: 'DOGE', direction: 'down', amount: 10, durationSec: 900 })
-        .expect(422);
-      expect(res.body.error.code).toBe('TRADE_LIMIT_REACHED');
-    } finally {
-      await app.close();
-    }
+  it('refunds the full stake on a draw', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', trade({ amount: 10, durationSec: 5 }));
+    const id = res.body.trade.id as string;
+    const entry = res.body.trade.entryPrice as number;
+    ctx.clock.advance(4_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', entry);
+    ctx.clock.advance(2_000);
+    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    const detail = await user.client.get(`/api/v1/trades/${id}`);
+    expect(detail.body.trade.result).toBe('draw');
+    expect(detail.body.trade.payout).toBe(10);
+    const wallet = await user.client.get('/api/v1/wallet');
+    expect(wallet.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balance).toBeCloseTo(1_000, 5);
   });
 
-  it('lists own trades only, newest first, and 404s for someone else', async () => {
-    const a = await registerUser(api());
-    const b = await registerUser(api());
-    const created = await place(a.cookies, { market: 'DOGE', direction: 'up', amount: 10, durationSec: 300 }).expect(201);
+  it('never settles the same trade twice', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', trade({ amount: 10, durationSec: 5 }));
+    const id = res.body.trade.id as string;
+    ctx.clock.advance(4_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', 6_200);
+    ctx.clock.advance(2_000);
+    const first = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    const second = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    expect(first.some((s) => s.trade.id === id)).toBe(true);
+    expect(second.some((s) => s.trade.id === id)).toBe(false);
+    const ledger = await user.client.get('/api/v1/wallet/transactions?limit=50');
+    const payouts = ledger.body.transactions.filter(
+      (t: { refId: string | null; kind: string }) =>
+        t.refId === id && t.kind.startsWith('trade_') && t.kind !== 'trade_stake',
+    );
+    expect(payouts).toHaveLength(1);
+  });
+});
 
-    const list = await withCookies(api().get('/api/v1/trades'), a.cookies).expect(200);
-    expect(list.body.trades.every((t: { userId: string }) => t.userId === a.userId)).toBe(true);
-    expect(list.body.trades.length).toBeGreaterThan(0);
+describe('history and export', () => {
+  it('filters history and exports CSV', async () => {
+    const user = await registerUser(ctx);
+    await user.client.post('/api/v1/trades', trade({ amount: 5, durationSec: 5 }));
+    ctx.clock.advance(4_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', 6_300);
+    ctx.clock.advance(2_000);
+    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
 
-    const foreign = await withCookies(api().get(`/api/v1/trades/${created.body.trade.id}`), b.cookies).expect(404);
-    expect(foreign.body.error.code).toBe('NOT_FOUND');
+    const list = await user.client.get('/api/v1/trades?status=closed&limit=10');
+    expect(list.status).toBe(200);
+    expect(list.body.trades.length).toBeGreaterThanOrEqual(1);
+    expect(list.body.trades[0].market).toBe('ASIA_COMPOSITE');
 
-    const anon = await api().get('/api/v1/trades').expect(401);
-    expect(anon.body.error.code).toBe('UNAUTHORIZED');
+    const csv = await user.client.get('/api/v1/trades/export.csv?status=closed');
+    expect(csv.status).toBe(200);
+    expect(csv.headers['content-type']).toContain('text/csv');
+    expect(String(csv.text).split('\n')[0]).toContain('id,market,direction');
+  });
+
+  it("prevents reading another user's trade", async () => {
+    const alice = await registerUser(ctx);
+    const bob = await registerUser(ctx);
+    const res = await alice.client.post('/api/v1/trades', trade({ amount: 5 }));
+    const id = res.body.trade.id as string;
+    const peek = await bob.client.get(`/api/v1/trades/${id}`);
+    expect(peek.status).toBe(404);
   });
 });

@@ -26,6 +26,21 @@ export function paymentRoutes(ctx: AppContext): Router {
     }),
   );
 
+  /** Placeholder status used by the "Segera hadir" pages. */
+  router.get(
+    '/payments/methods',
+    asyncHandler((_req, res) => {
+      res.json({
+        enabled: false,
+        status: 'not_available',
+        message: 'Modul pembayaran belum tersedia',
+        methods: [],
+        simulation: true,
+        label: 'SIMULASI',
+      });
+    }),
+  );
+
   const notAvailable = asyncHandler((_req, res) => {
     const result = ctx.payments.notAvailable();
     res.status(501).json({ error: { code: 'NOT_AVAILABLE', message: result.message }, ...result });

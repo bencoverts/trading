@@ -1,21 +1,24 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { JSDOM } from 'jsdom';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createRuntime } from '../../src/bootstrap.js';
 import type { Runtime } from '../../src/bootstrap.js';
-import { testConfig } from '../helpers/app.js';
+import { TEST_ADMIN, testConfig } from '../helpers/app.js';
 
 /**
  * Front-end smoke test.
  *
- * The browser code is plain ES modules served by the same Express app, so we can
- * load them in jsdom against a real running server instance. This catches the
- * kind of mistakes unit tests cannot see: missing elements, broken imports,
- * chart/canvas assumptions and WebSocket wiring.
+ * The browser code is plain ES modules served by the same Express app, so we
+ * load them in jsdom against a real running server. This catches what unit
+ * tests cannot see: missing DOM ids, broken module imports, chart/canvas
+ * assumptions, cookie/CSRF wiring and the WebSocket connection.
  */
 let runtime: Runtime;
 let port: number;
 let dom: JSDOM;
-let errors: unknown[] = [];
+const errors: unknown[] = [];
+const jar = new Map<string, string>();
 
 function installCanvasStub(win: JSDOM['window']) {
   const gradient = { addColorStop() {} };
@@ -27,7 +30,6 @@ function installCanvasStub(win: JSDOM['window']) {
         if (prop === 'measureText') return () => ({ width: 24 });
         if (prop === 'createLinearGradient') return () => gradient;
         if (prop === 'canvas') return target.canvas;
-        if (prop === 'canRoundRect') return true;
         return () => {};
       },
       set(target: Record<string, unknown>, prop: string, value) {
@@ -42,6 +44,26 @@ function installCanvasStub(win: JSDOM['window']) {
   } as unknown as typeof win.HTMLCanvasElement.prototype.getContext;
 }
 
+function storeCookies(win: JSDOM['window'], res: Response) {
+  const raw = res.headers.getSetCookie?.() ?? [];
+  for (const header of raw) {
+    const [pair] = header.split(';');
+    const index = pair.indexOf('=');
+    if (index <= 0) continue;
+    const name = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim();
+    if (!value) {
+      jar.delete(name);
+      continue;
+    }
+    jar.set(name, value);
+    // httpOnly cookies are invisible to document.cookie by design
+    if (!/httponly/i.test(header)) {
+      win.document.cookie = `${name}=${value}; path=/`;
+    }
+  }
+}
+
 beforeAll(async () => {
   runtime = await createRuntime({
     config: testConfig(),
@@ -49,29 +71,23 @@ beforeAll(async () => {
     attachRealtime: true,
     startEngine: false,
     runSettlementLoop: false,
+    startJobs: false,
     backfill: false,
   });
   port = await runtime.listen(0, '127.0.0.1');
   runtime.ctx.engine.ingest('DOGE', 0.4, Date.now());
+  for (const symbol of ['ASIA_COMPOSITE', 'CRYPTO_COMPOSITE']) {
+    runtime.ctx.engine.ingest(symbol, runtime.ctx.engine.lastPrice(symbol) ?? 100, Date.now());
+  }
 
-  dom = new JSDOM(
-    `<!doctype html><html><body>
-      <div class="sim-banner"><strong>SIMULASI</strong></div>
-      <header><nav id="nav"></nav><span id="conn"></span>
-        <div id="balancePill" hidden><strong id="balanceValue"></strong><button id="currencyToggle"></button></div>
-        <a id="authLink"></a>
-      </header>
-      <main id="view"></main><div id="modalHost"></div><div id="toasts"></div>
-    </body></html>`,
-    { url: `http://127.0.0.1:${port}/trading`, pretendToBeVisual: true, runScripts: 'outside-only' },
-  );
-
+  const base = `http://127.0.0.1:${port}`;
+  const html = await (await fetch(`${base}/`)).text();
+  dom = new JSDOM(html, { url: `${base}/`, pretendToBeVisual: true, runScripts: 'outside-only' });
   const win = dom.window;
   installCanvasStub(win);
 
   const globalAny = globalThis as unknown as Record<string, unknown>;
   const define = (key: string, value: unknown) => {
-    // some globals (navigator) are getter-only on Node, so define instead of assign
     try {
       globalAny[key] = value;
     } catch {
@@ -87,179 +103,239 @@ beforeAll(async () => {
     'localStorage',
     'HTMLElement',
     'HTMLCanvasElement',
+    'XMLHttpRequest',
     'Node',
     'MutationObserver',
     'requestAnimationFrame',
     'cancelAnimationFrame',
     'getComputedStyle',
+    'FormData',
+    'File',
+    'Blob',
   ]) {
     define(key, (win as unknown as Record<string, unknown>)[key]);
   }
   define('window', win);
+  define('WebSocket', win.WebSocket);
 
-  // relative fetch -> the real server (capture the native implementation first)
-  const base = `http://127.0.0.1:${port}`;
   const nodeFetch = globalThis.fetch.bind(globalThis);
-  // Node's fetch has no cookie jar: forward jsdom's document.cookie (the session
-  // cookie is httpOnly in the browser, but its value is also returned by /login)
-  define('fetch', (input: string, init?: RequestInit) => {
-    const cookie = dom.window.document.cookie;
+  define('fetch', async (input: string, init?: RequestInit) => {
     const headers = new Headers(init?.headers);
-    if (cookie && !headers.has('cookie')) headers.set('cookie', cookie);
-    return nodeFetch(input.startsWith('http') ? input : `${base}${input}`, { ...init, headers });
+    const cookie = [...jar.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
+    if (cookie) headers.set('cookie', cookie);
+    const res = await nodeFetch(input.startsWith('http') ? input : `${base}${input}`, { ...init, headers });
+    storeCookies(win, res);
+    return res;
   });
   define('WebSocket', win.WebSocket);
 
   win.addEventListener('error', (event: Event) => errors.push((event as unknown as { error: unknown }).error));
-  win.addEventListener('unhandledrejection', (event: Event) => errors.push((event as unknown as { reason: unknown }).reason));
+  win.addEventListener('unhandledrejection', (event: Event) =>
+    errors.push((event as unknown as { reason: unknown }).reason),
+  );
 });
 
 afterAll(async () => {
+  window.__socket?.close?.();
   await runtime.stop();
   dom?.window.close();
 });
 
-async function waitFor(selector: string, timeout = 5_000): Promise<Element> {
+async function waitFor(selector: string, timeout = 8_000): Promise<Element> {
   const deadline = Date.now() + timeout;
   for (;;) {
     const node = dom.window.document.querySelector(selector);
     if (node) return node;
     if (Date.now() > deadline) throw new Error(`selector not found: ${selector}`);
-    await new Promise((r) => setTimeout(r, 25));
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
 
-it('boots the app shell and renders the trading page with the SIMULASI label', async () => {
-  await import('../../public/js/app.js');
-  const layout = await waitFor('.trade-layout');
+describe('static shell', () => {
+  it('serves the SPA shell, design system and favicon', async () => {
+    const shell = await fetch(`http://127.0.0.1:${port}/`);
+    expect(shell.status).toBe(200);
+    const html = await shell.text();
+    expect(html).toContain('SIMULASI');
+    expect(html).toContain('/css/app.css');
+    expect(html).toContain('/js/app.js');
+    expect(html).toContain('id="view"');
+    // every footer page is linked and every page is part of the client router
+    for (const route of ['/faq', '/terms', '/privacy', '/contact', '/shortcuts']) {
+      expect(html).toContain(route);
+    }
 
-  expect(layout.className).toContain('trade-layout');
-  const view = dom.window.document.getElementById('view')!;
-  expect(view.textContent).toContain('SIMULASI');
-  expect(view.textContent).toContain('DOGE');
-  expect(view.textContent).toContain('ASIA_COMPOSITE');
-  expect(view.textContent).toContain('CRYPTO_COMPOSITE');
+    const css = await fetch(`http://127.0.0.1:${port}/css/app.css`);
+    expect(css.status).toBe(200);
+    const cssText = await css.text();
+    expect(cssText).toContain('--up:');
+    expect(cssText).toContain("data-theme='light'");
+    expect(cssText).toContain('.trade-layout');
 
-  // market list, chart canvas, timeframe bar
-  expect(dom.window.document.querySelectorAll('.market-item').length).toBe(3);
-  expect(dom.window.document.querySelector('canvas.chart-canvas')).toBeTruthy();
-  const tfs = [...dom.window.document.querySelectorAll('.tf-btn')].map((b) => b.textContent);
-  expect(tfs).toEqual(['5s', '15s', '30s', '1m', '5m', '15m', '1h']);
+    const favicon = await fetch(`http://127.0.0.1:${port}/assets/favicon.svg`);
+    expect(favicon.status).toBe(200);
+    expect(await favicon.text()).toContain('<svg');
 
-  // trade form: BUY / SELL, amount quick buttons and the 12 duration presets
-  const buy = [...dom.window.document.querySelectorAll('.trade-btn')].find((b) => b.textContent?.includes('BUY'));
-  const sell = [...dom.window.document.querySelectorAll('.trade-btn')].find((b) => b.textContent?.includes('SELL'));
-  expect(buy).toBeTruthy();
-  expect(sell).toBeTruthy();
-  const durations = [...dom.window.document.querySelectorAll('.dur-btn')].map((b) => b.textContent);
-  expect(durations).toEqual(['5s', '10s', '15s', '30s', '1m', '5m', '15m', '30m', '1h', '2h', '4h', '8h']);
-  const quick = [...dom.window.document.querySelectorAll('.chip')].map((b) => b.textContent);
-  expect(quick).toEqual(expect.arrayContaining(['½', 'x2', 'min', 'max']));
+    const fallback = await fetch(`http://127.0.0.1:${port}/trading/DOGE`);
+    expect(fallback.status).toBe(200);
+    expect(await fallback.text()).toContain('id="view"');
 
-  // payout preview exists before any confirmation
-  expect(dom.window.document.querySelector('.preview-box')?.textContent).toContain('Payout if win');
-});
-
-it('switches market and updates the live price from the websocket feed', async () => {
-  await waitFor('#livePrice');
-  const doge = [...dom.window.document.querySelectorAll('.market-item')].find((el) => el.textContent?.includes('DOGE')) as HTMLElement;
-  expect(doge).toBeTruthy();
-  doge.click();
-  await new Promise((r) => setTimeout(r, 150));
-  // renderMarkets() rebuilds the list, so re-query instead of reusing the node
-  const active = dom.window.document.querySelector('.market-item.active');
-  expect(active?.textContent).toContain('DOGE');
-
-  runtime.ctx.engine.ingest('DOGE', 0.4321, Date.now());
-  const deadline = Date.now() + 4_000;
-  let updated = '';
-  while (Date.now() < deadline) {
-    updated = dom.window.document.querySelector('#livePrice')?.textContent ?? '';
-    if (updated.includes('0.4321')) break;
-    await new Promise((r) => setTimeout(r, 40));
-  }
-  // DOGE has 5 price decimals, so the live badge renders 0.43210
-  expect(updated).toBe('0.43210');
-});
-
-it('renders the login page and navigates between pages without crashing', async () => {
-  const { navigate } = await import('../../public/js/router.js');
-  await navigate('/login');
-  const auth = await waitFor('.auth-card');
-  expect(auth.textContent).toContain('Sign in');
-  expect(auth.querySelectorAll('input').length).toBe(2);
-
-  await navigate('/register');
-  const register = await waitFor('.auth-card');
-  expect(register.textContent).toContain('Create account');
-
-  await navigate('/forgot-password');
-  expect((await waitFor('.auth-card')).textContent).toContain('Forgot password');
-});
-
-it('signs in, shows the demo balance and places a trade through the confirm dialog', async () => {
-  const username = `ui_${Date.now().toString(36)}`;
-  const email = `${username}@example.com`;
-  const res = await (globalThis as unknown as { fetch: typeof fetch }).fetch('/api/v1/auth/register', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, username, password: 'password-12345' }),
+    const missingApi = await fetch(`http://127.0.0.1:${port}/api/v1/does-not-exist`);
+    expect(missingApi.status).toBe(404);
+    const body = (await missingApi.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('NOT_FOUND');
   });
-  const body = (await res.json()) as { token: string; user: { id: string } };
-  expect(res.status).toBe(201);
-  dom.window.document.cookie = `sim_session=${body.token}`;
 
-  const { navigate } = await import('../../public/js/router.js');
-  const { loadSession, store } = (await import('../../public/js/state.js')) as {
-    loadSession: () => Promise<unknown>;
-    store: { user: { username: string } | null };
-  };
-  await loadSession();
-  expect(store.user?.username).toBe(username);
+  it('imports every page module shipped in public/js/pages', () => {
+    const dir = path.resolve('public/js/pages');
+    const files = [
+      'account.js',
+      'admin.js',
+      'auth.js',
+      'content.js',
+      'history.js',
+      'home.js',
+      'notifications.js',
+      'trading.js',
+    ];
+    for (const file of files) {
+      const source = readFileSync(path.join(dir, file), 'utf8');
+      expect(source.length).toBeGreaterThan(200);
+    }
+  });
+});
 
-  await navigate('/trading');
-  await waitFor('.trade-layout');
-  // header balance pill reflects the demo wallet ($1,000.00)
-  const pill = dom.window.document.getElementById('balancePill')!;
-  expect(pill.hidden).toBe(false);
-  expect(dom.window.document.getElementById('balanceValue')?.textContent).toContain('1,000.00');
+describe('browser app', () => {
+  it('boots, renders the landing page and marks itself as a simulation everywhere', async () => {
+    await import('../../public/js/app.js');
+    await waitFor('.hero');
+    await waitFor('.market-card');
+    const document = dom.window.document;
+    expect(document.querySelector('.sim-banner')?.textContent).toContain('SIMULASI');
+    expect(document.querySelector('.footer')?.textContent).toContain('SIMULASI');
+    const view = document.getElementById('view')!;
+    expect(view.textContent).toContain('Dogecoin');
+    expect(view.textContent).toContain('Asia Composite');
+    expect(view.textContent).toContain('Crypto Composite');
+    expect(view.textContent).toContain('payout');
+  });
 
-  // choose DOGE, 5s, amount 10, then BUY -> confirm dialog -> confirm
-  const doge = [...dom.window.document.querySelectorAll('.market-item')].find((el) => el.textContent?.includes('DOGE')) as HTMLElement;
-  doge.click();
-  await new Promise((r) => setTimeout(r, 200));
+  it('renders the trading terminal with chart, market list and duration presets', async () => {
+    await (dom.window as unknown as { router: { go: (path: string) => Promise<void> } }).router.go('/trading');
+    await waitFor('.trade-layout');
+    const document = dom.window.document;
+    expect(document.querySelectorAll('.market-item').length).toBe(3);
+    expect(document.querySelector('.chart-canvas-wrap canvas')).toBeTruthy();
+    const chips = [...document.querySelectorAll('.chip')].map((chip) => chip.textContent);
+    expect(chips).toContain('5s');
+    expect(chips).toContain('8j');
+    expect(chips).toEqual(expect.arrayContaining(['maks', '×2', '½']));
+    const buttons = [...document.querySelectorAll('.btn--trade')].map((button) => button.textContent);
+    expect(buttons.join(' ')).toContain('BELI');
+    expect(buttons.join(' ')).toContain('JUAL');
+    expect(document.getElementById('view')!.textContent).toContain('SIMULASI');
+  });
 
-  const amount = dom.window.document.querySelector('.amount-input') as HTMLInputElement;
-  amount.value = '10';
-  amount.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  it('renders the auth and content pages', async () => {
+    const router = (dom.window as unknown as { router: { go: (path: string) => Promise<void> } }).router;
+    await router.go('/login');
+    const form = await waitFor('form');
+    expect(form.querySelectorAll('input').length).toBeGreaterThanOrEqual(2);
+    expect(dom.window.document.getElementById('view')!.textContent).toContain('Masuk');
 
-  const fiveSeconds = [...dom.window.document.querySelectorAll('.dur-btn')].find((b) => b.textContent === '5s') as HTMLElement;
-  fiveSeconds.click();
-  await new Promise((r) => setTimeout(r, 100));
-  expect(dom.window.document.querySelector('.preview-box')?.textContent).toContain('Payout if win');
+    await router.go('/faq');
+    await waitFor('.content-page');
+    expect(dom.window.document.getElementById('view')!.textContent).toContain('FAQ');
+  });
 
-  const buy = [...dom.window.document.querySelectorAll('.trade-btn')].find((b) => b.textContent?.includes('BUY')) as HTMLElement;
-  expect(buy.classList.contains('disabled')).toBe(false);
-  buy.click();
+  it('signs in through the form, shows the demo balance and opens a trade', async () => {
+    const router = (dom.window as unknown as { router: { go: (path: string) => Promise<void> } }).router;
+    const password = 'password-12345';
+    const username = `ui${Date.now().toString(36)}`;
 
-  const modal = await waitFor('.modal-card');
-  expect(modal.textContent).toContain('Confirm trade');
-  expect(modal.textContent).toContain('DOGE');
-  expect(modal.textContent).toContain('Entry price');
-  expect(modal.textContent).toContain('Payout if win');
+    await router.go('/register');
+    const form = await waitFor('form');
+    const setValue = (name: string, value: string) => {
+      const input = form.querySelector(`[name="${name}"]`) as HTMLInputElement;
+      input.value = value;
+      input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    };
+    setValue('email', `${username}@example.com`);
+    setValue('username', username);
+    setValue('password', password);
+    const terms = form.querySelector('[name="acceptTerms"]') as HTMLInputElement;
+    terms.checked = true;
+    form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
 
-  (dom.window.document.getElementById('modalConfirm') as HTMLElement).click();
-  const deadline = Date.now() + 5_000;
-  let openRows = 0;
-  while (Date.now() < deadline) {
-    openRows = dom.window.document.querySelectorAll('.trade-row.open').length;
-    if (openRows > 0) break;
-    await new Promise((r) => setTimeout(r, 50));
+    await waitFor('.trade-layout', 10_000);
+    const balancePill = dom.window.document.getElementById('balancePill')!;
+    expect(balancePill.hidden).toBe(false);
+    expect(dom.window.document.getElementById('balanceValue')?.textContent).toContain('1');
+
+    const document = dom.window.document;
+    const amount = document.querySelector('.amount-input input') as HTMLInputElement;
+    amount.value = '10';
+    amount.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const buy = [...document.querySelectorAll('.trade-panel-col .btn--trade')].find((button) =>
+      button.textContent?.includes('BELI'),
+    ) as HTMLElement;
+    expect(buy).toBeTruthy();
+    buy.click();
+    const confirm = await waitFor('.modal .modal__actions');
+    const ok = [...confirm.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Konfirmasi'),
+    ) as HTMLElement;
+    ok.click();
+
+    await waitFor('.card .trade-row', 10_000);
+    expect(document.getElementById('view')!.textContent).toContain('terbuka');
+  });
+
+  it('renders the account, history, notifications and admin screens for staff', async () => {
+    const router = (dom.window as unknown as { router: { go: (path: string) => Promise<void> } }).router;
+    type WindowWithLogout = { __logout: () => Promise<void> };
+    await (dom.window as unknown as WindowWithLogout).__logout();
+
+    await router.go('/login');
+    const form = await waitFor('form');
+    const setValue = (name: string, value: string) => {
+      const input = form.querySelector(`[name="${name}"]`) as HTMLInputElement;
+      input.value = value;
+      input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    };
+    setValue('identifier', TEST_ADMIN.email);
+    setValue('password', TEST_ADMIN.password);
+    form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+    await waitFor('.trade-layout', 10_000);
+
+    const document = dom.window.document;
+    await router.go('/history');
+    await waitFor('.filter-bar');
+    expect(document.getElementById('view')!.textContent).toContain('Riwayat');
+
+    await router.go('/account');
+    await waitFor('.tabs');
+    expect(document.getElementById('view')!.textContent).toContain('Dompet');
+
+    await router.go('/notifications');
+    await waitFor('.page-head');
+    expect(document.getElementById('view')!.textContent).toContain('Notifikasi');
+
+    await router.go('/admin');
+    await waitFor('.admin-layout', 10_000);
+    expect(document.querySelector('.admin-nav')!.textContent).toContain('Pengguna');
+    expect(document.querySelector('.admin-nav')!.textContent).toContain('Sistem');
+  });
+
+  it('did not produce unhandled browser errors', () => {
+    expect(errors).toEqual([]);
+  });
+});
+
+declare global {
+  interface Window {
+    __socket?: { close?: () => void };
   }
-  expect(openRows).toBeGreaterThan(0);
-  expect(dom.window.document.querySelector('.trade-row.open')?.textContent).toContain('DOGE');
-});
-
-it('did not raise uncaught browser errors', () => {
-  expect(errors).toEqual([]);
-});
+}

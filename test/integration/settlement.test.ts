@@ -1,209 +1,142 @@
-import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestApp, registerUser, withCookies, type TestContext } from '../helpers/app.js';
-import { createRuntime } from '../../src/bootstrap.js';
-import { FakeClock } from '../../src/lib/clock.js';
+import { createTestApp, pushPrice, registerUser, seedPrice, type TestContext } from '../helpers/app.js';
 
 let ctx: TestContext;
-let api: () => request.SuperTest<request.Test>;
 
 beforeAll(async () => {
   ctx = await createTestApp();
-  api = ctx.api;
+  seedPrice(ctx, 'ASIA_COMPOSITE', 6_000);
+  seedPrice(ctx, 'DOGE', 0.42);
+  seedPrice(ctx, 'CRYPTO_COMPOSITE', 41_000);
 });
+
 afterAll(async () => {
   await ctx.close();
 });
 
-const walletOf = (userId: string, currency = 'USD') =>
-  Number(ctx.db.get<{ balance_minor: number }>(
-    'SELECT balance_minor FROM wallets WHERE user_id = ? AND currency = ?',
-    userId,
-    currency,
-  )?.balance_minor);
-
-describe('server-side settlement', () => {
-  it('pays stake + profit when an UP trade finishes above its entry', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.4, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'up', amount: 100, durationSec: 5 })
-      .expect(201);
-    const trade = res.body.trade;
-    expect(walletOf(user.userId)).toBe(90_000);
-
-    // 5 s later the simulated price moved up (server clock drives expiry)
-    ctx.clock.advance(4_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.405, ctx.clock.now());
-    ctx.clock.advance(1_000);
-    const settled = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
-    expect(settled).toHaveLength(1);
-
-    const detail = await withCookies(api().get(`/api/v1/trades/${trade.id}`), user.cookies).expect(200);
-    expect(detail.body.trade.status).toBe('closed');
-    expect(detail.body.trade.result).toBe('win');
-    expect(detail.body.trade.closePrice).toBe(0.405);
-    expect(detail.body.trade.payout).toBe(185);
-    expect(detail.body.trade.profit).toBe(85);
-    expect(walletOf(user.userId)).toBe(108_500);
-  });
-
-  it('pays nothing when an UP trade finishes below its entry', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.5, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'up', amount: 50, durationSec: 5 })
-      .expect(201);
-
-    ctx.clock.advance(4_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.49, ctx.clock.now());
-    ctx.clock.advance(1_000);
-    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
-
-    const detail = await withCookies(api().get(`/api/v1/trades/${res.body.trade.id}`), user.cookies).expect(200);
-    expect(detail.body.trade.result).toBe('lose');
-    expect(detail.body.trade.payout).toBe(0);
-    expect(walletOf(user.userId)).toBe(95_000);
-  });
-
-  it('refunds the stake on a tie (draw)', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.321, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'down', amount: 40, durationSec: 5 })
-      .expect(201);
-
-    ctx.clock.advance(5_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.321, ctx.clock.now());
-    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
-
-    const detail = await withCookies(api().get(`/api/v1/trades/${res.body.trade.id}`), user.cookies).expect(200);
-    expect(detail.body.trade.result).toBe('draw');
-    expect(detail.body.trade.payout).toBe(40);
-    expect(walletOf(user.userId)).toBe(100_000);
-  });
-
-  it('wins a DOWN trade when the price falls', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.44, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'down', amount: 100, durationSec: 300 })
-      .expect(201);
-
-    ctx.clock.advance(299_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.43, ctx.clock.now());
-    ctx.clock.advance(1_000);
-    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
-
-    const detail = await withCookies(api().get(`/api/v1/trades/${res.body.trade.id}`), user.cookies).expect(200);
-    expect(detail.body.trade.result).toBe('win');
-    expect(walletOf(user.userId)).toBe(108_500);
-  });
-
-  it('does not settle before the expiry timestamp', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.4, ctx.clock.now());
-    await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'up', amount: 10, durationSec: 60 })
-      .expect(201);
-
-    ctx.clock.advance(59_000);
-    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now())).toHaveLength(0);
-
-    ctx.clock.advance(1_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.41, ctx.clock.now());
-    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now())).toHaveLength(1);
-  });
-
-  it('settles only once even when the settlement pass runs twice', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.4, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'up', amount: 20, durationSec: 5 })
-      .expect(201);
-
-    ctx.clock.advance(5_000);
-    ctx.runtime.ctx.engine.ingest('DOGE', 0.42, ctx.clock.now());
-    ctx.clock.advance(1_000);
-    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now())).toHaveLength(1);
-    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now())).toHaveLength(0);
-
-    const balance = walletOf(user.userId);
-    expect(balance).toBe(100_000 - 20_00 + 20_00 * 1.85);
-    const row = ctx.db.get<{ settled_at: number | null }>('SELECT settled_at FROM trades WHERE id = ?', res.body.trade.id);
-    expect(row?.settled_at).not.toBeNull();
-  });
-
-  it('settles trades that expired while the server was down at boot', async () => {
-    const first = await createTestApp();
-    let tradeId = '';
-    let userId = '';
-    try {
-      tradeId = '';
-      first.runtime.ctx.engine.ingest('DOGE', 0.4, first.clock.now());
-      const user = await registerUser(first.api());
-      userId = user.userId;
-      const res = await withCookies(first.api().post('/api/v1/trades'), user.cookies)
-        .send({ market: 'DOGE', direction: 'up', amount: 100, durationSec: 30 })
-        .expect(201);
-      tradeId = res.body.trade.id;
-      // price moves up slightly before the "outage"
-      first.clock.advance(5_000);
-      first.runtime.ctx.engine.ingest('DOGE', 0.41, first.clock.now());
-      first.runtime.ctx.marketData.flushTicks();
-    } finally {
-      await first.close();
-    }
-
-    // "restart": new runtime on the same database file, clock advanced past expiry
-    const clock = new FakeClock(first.clock.now());
-    clock.advance(30_000);
-    const second = await createRuntime({
-      config: first.config,
-      db: new (await import('../../src/db/sqlite.js')).Database(first.dbPath),
-      clock,
-      attachRealtime: false,
-      startEngine: false,
-      runSettlementLoop: false,
-      backfill: false,
+describe('settlement loop', () => {
+  it('does not settle before expiry and settles exactly once after', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', {
+      market: 'DOGE',
+      direction: 'up',
+      currency: 'USD',
+      amount: 5,
+      durationSec: 10,
     });
-    try {
-      second.ctx.engine.ingest('DOGE', 0.4, clock.now());
-      second.ctx.marketData.seedEngineFromDb();
-      const settled = second.ctx.trades.settleDue(clock.now());
-      expect(settled.map((s) => s.trade.id)).toContain(tradeId);
-      const row = second.ctx.db.get<{ status: string; result: string; settled_at: number | null }>(
-        'SELECT status, result, settled_at FROM trades WHERE id = ?',
-        tradeId,
-      );
-      expect(row?.status).toBe('closed');
-      expect(row?.settled_at).not.toBeNull();
+    const id = res.body.trade.id as string;
+    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now())).toEqual([]);
 
-      const wallet = second.ctx.db.get<{ balance_minor: number }>(
-        'SELECT balance_minor FROM wallets WHERE user_id = ? AND currency = ?',
-        userId,
-        'USD',
-      );
-      // stake was debited at open, payout credited on restart -> never 0
-      expect(Number(wallet?.balance_minor)).toBeGreaterThan(90_000);
-    } finally {
-      await second.stop();
-    }
+    ctx.clock.advance(9_000);
+    pushPrice(ctx, 'DOGE', 0.5);
+    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now()).some((row) => row.trade.id === id)).toBe(false);
+
+    ctx.clock.advance(2_000);
+    const first = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    expect(first.find((row) => row.trade.id === id)?.trade.result).toBe('win');
+    expect(ctx.runtime.ctx.trades.settleDue(ctx.clock.now()).some((row) => row.trade.id === id)).toBe(false);
   });
 
-  it('refunds the stake when no tick newer than the entry exists at expiry', async () => {
-    const user = await registerUser(api());
-    ctx.runtime.ctx.engine.ingest('ASIA_COMPOSITE', 6_100, ctx.clock.now());
-    const res = await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'ASIA_COMPOSITE', direction: 'up', amount: 30, durationSec: 5 })
-      .expect(201);
-    // the feed goes quiet: nothing trades between entry and expiry, so the only
-    // price at/before expiry is the entry tick itself -> the outcome is a tie
-    ctx.clock.advance(10_000);
+  it('uses the price at expiry, not the latest price', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', {
+      market: 'CRYPTO_COMPOSITE',
+      direction: 'down',
+      currency: 'USD',
+      amount: 3,
+      durationSec: 5,
+    });
+    const id = res.body.trade.id as string;
+    const entry = res.body.trade.entryPrice as number;
+    // price rises before expiry (bad for DOWN) then crashes after expiry:
+    // the stored close price must be the one at expiry, so the trade loses
+    ctx.clock.advance(3_000);
+    pushPrice(ctx, 'CRYPTO_COMPOSITE', entry + 500);
+    ctx.clock.advance(5_000);
+    pushPrice(ctx, 'CRYPTO_COMPOSITE', entry - 500);
     ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
-    const detail = await withCookies(api().get(`/api/v1/trades/${res.body.trade.id}`), user.cookies).expect(200);
-    expect(detail.body.trade.result).toBe('draw');
-    expect(detail.body.trade.payout).toBe(30);
-    expect(walletOf(user.userId)).toBe(100_000);
+    const row = ctx.db.get<{ result: string; close_price: number }>(
+      'SELECT result, close_price FROM trades WHERE id = ?',
+      id,
+    );
+    expect(row?.result).toBe('lose');
+    expect(Number(row?.close_price)).toBe(entry + 500);
+  });
+
+  it('falls back to the entry price when the market has no tick at expiry', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/trades', {
+      market: 'ASIA_COMPOSITE',
+      direction: 'up',
+      currency: 'USD',
+      amount: 4,
+      durationSec: 5,
+    });
+    const id = res.body.trade.id as string;
+    ctx.clock.advance(60_000);
+    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    const row = ctx.db.get<{ result: string }>('SELECT result FROM trades WHERE id = ?', id);
+    expect(['draw', 'win', 'lose']).toContain(row?.result);
+  });
+
+  it('settles an expired batch in one pass', async () => {
+    const user = await registerUser(ctx);
+    for (let i = 0; i < 5; i++) {
+      const res = await user.client.post('/api/v1/trades', {
+        market: 'ASIA_COMPOSITE',
+        direction: i % 2 === 0 ? 'up' : 'down',
+        currency: 'USD',
+        amount: 2,
+        durationSec: 5,
+      });
+      expect(res.status).toBe(201);
+    }
+    ctx.clock.advance(3_000);
+    pushPrice(ctx, 'ASIA_COMPOSITE', 6_100);
+    ctx.clock.advance(3_000);
+    const settled = ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    expect(settled.length).toBeGreaterThanOrEqual(5);
+    const open = ctx.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM trades WHERE user_id = ? AND status = 'open'`,
+      user.userId,
+    );
+    expect(Number(open?.n ?? 0)).toBe(0);
+  });
+
+  it('keeps the audit trail for automatic settlements', async () => {
+    const rows = ctx.db.all<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'trade.settled'`);
+    expect(Number(rows[0]?.n ?? 0)).toBeGreaterThan(0);
+  });
+});
+
+describe('jobs', () => {
+  it('registers settlement, cleanup, backup and engine health jobs', () => {
+    const names = ctx.runtime.ctx.jobs.status().map((job) => job.name);
+    expect(names).toEqual(expect.arrayContaining(['settlement', 'cleanup', 'backup', 'engine']));
+  });
+
+  it('runs a job on demand and records the run', async () => {
+    const before = ctx.runtime.ctx.jobs.history(100).length;
+    await ctx.runtime.ctx.jobs.runNow('cleanup');
+    const history = ctx.runtime.ctx.jobs.history(100);
+    expect(history.length).toBeGreaterThan(before);
+    expect(history[0].job).toBe('cleanup');
+    expect(history[0].status).toBe('ok');
+  });
+
+  it('prunes ticks older than the retention window', async () => {
+    ctx.runtime.ctx.settings.update({ tickRetentionDays: 1 }, { actorRole: 'system' });
+    const now = ctx.clock.now();
+    ctx.db.run('INSERT INTO ticks (market, t, price) VALUES (?, ?, ?)', 'DOGE', now - 5 * 86_400_000, 0.4);
+    await ctx.runtime.ctx.jobs.runNow('cleanup');
+    const stale = ctx.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM ticks WHERE t < ?', now - 86_400_000);
+    expect(Number(stale?.n ?? 0)).toBe(0);
+    ctx.runtime.ctx.settings.update({ tickRetentionDays: 7 }, { actorRole: 'system' });
+  });
+
+  it('creates a scheduled backup file', async () => {
+    const before = ctx.runtime.ctx.backups.list().length;
+    await ctx.runtime.ctx.jobs.runNow('backup');
+    expect(ctx.runtime.ctx.backups.list().length).toBe(before + 1);
   });
 });

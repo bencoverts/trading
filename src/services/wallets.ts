@@ -1,10 +1,11 @@
 import type { Database } from '../db/sqlite.js';
 import type { SettingsService } from './settings.js';
+import type { LedgerService } from './ledger.js';
 import { recordAudit } from './audit.js';
 import { AppError } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { CURRENCY_LIST, type Currency } from '../domain/constants.js';
-import { toMajor } from '../domain/money.js';
+import { toMajor, toMinor, scaleOf } from '../domain/money.js';
 
 export interface WalletRow {
   user_id: string;
@@ -22,12 +23,20 @@ export interface WalletView {
 export interface WalletServiceDeps {
   db: Database;
   settings: SettingsService;
+  ledger: LedgerService;
   now?: () => number;
 }
 
+export interface TopUpResult {
+  wallet: WalletView;
+  nextAllowedAt: number;
+}
+
 /**
- * All balance changes go through this service and run inside a single
- * `BEGIN IMMEDIATE` transaction, so concurrent requests cannot overdraw.
+ * All balance changes go through this service and, when they are part of a
+ * bigger operation, run inside the caller's `BEGIN IMMEDIATE` transaction so
+ * concurrent requests can never overdraw. Every movement is mirrored into the
+ * ledger with the resulting balance.
  */
 export class WalletService {
   private readonly now: () => number;
@@ -42,7 +51,7 @@ export class WalletService {
 
   get(userId: string, currency: Currency): WalletRow {
     const row = this.db.get<WalletRow>('SELECT * FROM wallets WHERE user_id = ? AND currency = ?', userId, currency);
-    if (!row) throw AppError.notFound('Wallet not found');
+    if (!row) throw AppError.notFound('Dompet tidak ditemukan');
     return row;
   }
 
@@ -55,109 +64,217 @@ export class WalletService {
     });
   }
 
-  /**
-   * Debits a wallet. Must be called inside an existing transaction when the
-   * caller needs atomicity with another write (e.g. inserting the trade).
-   */
-  debit(userId: string, currency: Currency, amountMinor: number): number {
+  /** Debit with the ledger entry. Must run inside the caller's transaction for atomicity. */
+  debit(
+    userId: string,
+    currency: Currency,
+    amountMinor: number,
+    meta: { kind: string; refType?: string; refId?: string; note?: string } = { kind: 'debit' },
+  ): number {
     if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
-      throw AppError.badRequest('amount must be a positive integer in minor units');
+      throw AppError.badRequest('nominal harus bilangan bulat positif (minor unit)');
     }
+    const at = this.now();
     const result = this.db.run(
       `UPDATE wallets SET balance_minor = balance_minor - ?, updated_at = ?
        WHERE user_id = ? AND currency = ? AND balance_minor >= ?`,
       amountMinor,
-      this.now(),
+      at,
       userId,
       currency,
       amountMinor,
     );
     if (result.changes === 0) {
-      throw new AppError('INSUFFICIENT_FUNDS', 422, 'Insufficient demo balance', { currency, requiredMinor: amountMinor });
+      throw new AppError('INSUFFICIENT_FUNDS', 422, 'Saldo demo tidak cukup', { currency, requiredMinor: amountMinor });
     }
-    return this.get(userId, currency).balance_minor;
+    const balance = Number(this.get(userId, currency).balance_minor);
+    this.deps.ledger.write({
+      userId,
+      currency,
+      kind: meta.kind,
+      direction: 'debit',
+      amountMinor,
+      balanceAfterMinor: balance,
+      refType: meta.refType ?? null,
+      refId: meta.refId ?? null,
+      meta: meta.note ? { note: meta.note } : null,
+      now: at,
+    });
+    return balance;
   }
 
-  credit(userId: string, currency: Currency, amountMinor: number): number {
+  credit(
+    userId: string,
+    currency: Currency,
+    amountMinor: number,
+    meta: { kind: string; refType?: string; refId?: string; note?: string } = { kind: 'credit' },
+  ): number {
     if (!Number.isInteger(amountMinor) || amountMinor < 0) {
-      throw AppError.badRequest('amount must be a non-negative integer in minor units');
+      throw AppError.badRequest('nominal harus bilangan bulat non-negatif (minor unit)');
     }
-    if (amountMinor === 0) return this.get(userId, currency).balance_minor;
+    const current = Number(this.get(userId, currency).balance_minor);
+    if (amountMinor === 0) return current;
+    const at = this.now();
     const result = this.db.run(
       'UPDATE wallets SET balance_minor = balance_minor + ?, updated_at = ? WHERE user_id = ? AND currency = ?',
       amountMinor,
-      this.now(),
+      at,
       userId,
       currency,
     );
-    if (result.changes === 0) throw AppError.notFound('Wallet not found');
-    return this.get(userId, currency).balance_minor;
+    if (result.changes === 0) throw AppError.notFound('Dompet tidak ditemukan');
+    const balance = Number(this.get(userId, currency).balance_minor);
+    this.deps.ledger.write({
+      userId,
+      currency,
+      kind: meta.kind,
+      direction: 'credit',
+      amountMinor,
+      balanceAfterMinor: balance,
+      refType: meta.refType ?? null,
+      refId: meta.refId ?? null,
+      meta: meta.note ? { note: meta.note } : null,
+      now: at,
+    });
+    return balance;
   }
 
-  /**
-   * DEMO top-up (virtual money only). Capped per transaction and per day.
-   */
-  topUp(userId: string, currency: Currency, amountMinor: number, ip?: string | null): WalletView {
+  /** Preview for the UI: payout of a conversion without applying it. */
+  quote(from: Currency, to: Currency, amountMinor: number): { fromMinor: number; toMinor: number; rate: number } {
+    if (amountMinor <= 0) throw AppError.badRequest('nominal harus lebih dari 0');
+    const settings = this.deps.settings.get();
+    const rate = settings.rates[to] / settings.rates[from];
+    const toMinor = Math.round((amountMinor / scaleOf(from)) * rate * scaleOf(to));
+    return { fromMinor: amountMinor, toMinor, rate };
+  }
+
+  /** Demo currency conversion (display + demo balance only), fully ledgered. */
+  convert(
+    userId: string,
+    from: Currency,
+    to: Currency,
+    amountMinor: number,
+  ): { from: WalletView; to: WalletView; rate: number } {
+    if (from === to) throw AppError.badRequest('Mata uang asal dan tujuan sama');
+    const quote = this.quote(from, to, amountMinor);
+    if (quote.toMinor <= 0) throw new AppError('CONVERSION_INVALID', 422, 'Nilai konversi terlalu kecil');
+    const now = this.now();
+    this.db.transaction(() => {
+      this.debit(userId, from, amountMinor, { kind: 'conversion_out', refType: 'conversion', refId: `${from}->${to}` });
+      // rounding dust is discarded, never invented
+      this.credit(userId, to, quote.toMinor, { kind: 'conversion_in', refType: 'conversion', refId: `${from}->${to}` });
+      this.db.run(
+        `INSERT INTO conversions (id, user_id, from_currency, to_currency, from_minor, to_minor, rate, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        newId(),
+        userId,
+        from,
+        to,
+        amountMinor,
+        quote.toMinor,
+        quote.rate,
+        now,
+      );
+      recordAudit(this.db, {
+        actorUserId: userId,
+        actorRole: 'user',
+        action: 'wallet.converted',
+        targetType: 'wallet',
+        targetId: userId,
+        meta: { from, to, amountMinor, toMinor: quote.toMinor, rate: quote.rate },
+        now,
+      });
+    });
+    return { from: this.viewOf(userId, from), to: this.viewOf(userId, to), rate: quote.rate };
+  }
+
+  /** Instant DEMO top-up, capped per transaction and rate-limited by a cooldown. */
+  topUp(userId: string, currency: Currency, amountMinor: number, ip?: string | null): TopUpResult {
     const settings = this.deps.settings.get();
     const max = settings.topupMax[currency];
     if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
-      throw AppError.badRequest('amount must be greater than 0');
+      throw AppError.badRequest('nominal harus lebih dari 0');
     }
     if (amountMinor > max) {
-      throw AppError.unprocessable('AMOUNT_NOT_ALLOWED', `Maximum demo top-up is ${max} minor units`, { maxMinor: max });
+      throw AppError.unprocessable('AMOUNT_NOT_ALLOWED', `Maksimum top-up demo ${toMajor(max, currency)} ${currency}`, {
+        maxMinor: max,
+      });
     }
     const now = this.now();
+    const last = this.db.get<{ created_at: number }>(
+      `SELECT created_at FROM ledger WHERE user_id = ? AND kind = 'demo_topup'
+        ORDER BY created_at DESC LIMIT 1`,
+      userId,
+    );
+    const cooldownMs = settings.topupCooldownSec * 1000;
+    if (last && now - Number(last.created_at) < cooldownMs) {
+      const nextAllowedAt = Number(last.created_at) + cooldownMs;
+      throw new AppError('COOLDOWN', 429, `Tunggu sebentar sebelum top-up lagi`, { nextAllowedAt });
+    }
     const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
     const count = this.db.get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM deposits WHERE user_id = ? AND kind = 'demo_topup' AND created_at >= ?`,
+      `SELECT COUNT(*) AS n FROM ledger WHERE user_id = ? AND kind = 'demo_topup' AND created_at >= ?`,
       userId,
       dayStart,
     );
     if (Number(count?.n ?? 0) >= settings.topupDailyCount) {
-      throw AppError.unprocessable('RATE_LIMITED', `Demo top-up limit reached (${settings.topupDailyCount}/day)`, {
+      throw new AppError('RATE_LIMITED', 429, `Batas top-up demo harian tercapai (${settings.topupDailyCount}x)`, {
         dailyLimit: settings.topupDailyCount,
       });
     }
 
     this.db.transaction(() => {
-      const balance = this.credit(userId, currency, amountMinor);
-      this.db.run(
-        `INSERT INTO deposits (id, user_id, currency, amount_minor, kind, note, created_at)
-         VALUES (?, ?, ?, ?, 'demo_topup', ?, ?)`,
-        newId(),
-        userId,
-        currency,
-        amountMinor,
-        'Instant demo top-up',
-        now,
-      );
+      this.credit(userId, currency, amountMinor, { kind: 'demo_topup', note: 'Top-up demo instan' });
       recordAudit(this.db, {
         actorUserId: userId,
         actorRole: 'user',
         action: 'wallet.demo_topup',
         targetType: 'wallet',
         targetId: userId,
-        meta: { currency, amountMinor, balanceMinor: balance },
+        meta: { currency, amountMinor },
         ip: ip ?? null,
         now,
       });
     });
-    return this.viewOf(userId, currency);
+    return { wallet: this.viewOf(userId, currency), nextAllowedAt: now + cooldownMs };
   }
 
   /** Restores every demo wallet to the configured starting balances. */
-  resetAll(userId: string, ip?: string | null): WalletView[] {
+  resetAll(userId: string, ip?: string | null): { wallets: WalletView[]; nextAllowedAt: number } {
     const settings = this.deps.settings.get();
     const now = this.now();
+    const last = this.db.get<{ created_at: number }>(
+      `SELECT created_at FROM ledger WHERE user_id = ? AND kind = 'demo_reset' ORDER BY created_at DESC LIMIT 1`,
+      userId,
+    );
+    const cooldownMs = settings.resetCooldownSec * 1000;
+    if (last && now - Number(last.created_at) < cooldownMs) {
+      throw new AppError('COOLDOWN', 429, 'Reset saldo demo masih dalam cooldown', {
+        nextAllowedAt: Number(last.created_at) + cooldownMs,
+      });
+    }
     this.db.transaction(() => {
       for (const currency of CURRENCY_LIST) {
+        const target = settings.initialBalance[currency];
+        const current = Number(this.get(userId, currency).balance_minor);
+        const delta = target - current;
         this.db.run(
           'UPDATE wallets SET balance_minor = ?, updated_at = ? WHERE user_id = ? AND currency = ?',
-          settings.initialBalance[currency],
+          target,
           now,
           userId,
           currency,
         );
+        this.deps.ledger.write({
+          userId,
+          currency,
+          kind: 'demo_reset',
+          direction: delta >= 0 ? 'credit' : 'debit',
+          amountMinor: Math.max(1, Math.abs(delta)),
+          balanceAfterMinor: target,
+          meta: { previousMinor: current, targetMinor: target },
+          now,
+        });
       }
       recordAudit(this.db, {
         actorUserId: userId,
@@ -170,40 +287,48 @@ export class WalletService {
         now,
       });
     });
-    return this.balances(userId);
+    return { wallets: this.balances(userId), nextAllowedAt: now + cooldownMs };
   }
 
-  /** Admin adjustment (audited, cannot go below zero). */
+  /** Admin adjustment (audited + ledgered, cannot go below zero). */
   adminAdjust(
     userId: string,
     currency: Currency,
-    deltaMinor: number,
-    actorUserId: string,
-    reason: string,
-    ip?: string | null,
+    mode: 'add' | 'subtract' | 'set',
+    amountMajorOrMinor: number,
+    opts: { reason: string; actorUserId: string; ip?: string | null; minor?: boolean },
   ): WalletView {
-    if (!Number.isInteger(deltaMinor) || deltaMinor === 0) {
-      throw AppError.badRequest('delta must be a non-zero integer in minor units');
+    const amountMinor = opts.minor ? Math.round(amountMajorOrMinor) : toMinor(amountMajorOrMinor, currency);
+    if (!Number.isInteger(amountMinor) || amountMinor < 0) {
+      throw AppError.badRequest('nominal tidak valid');
     }
     const now = this.now();
     this.db.transaction(() => {
-      if (deltaMinor > 0) this.credit(userId, currency, deltaMinor);
-      else this.debit(userId, currency, -deltaMinor);
+      const current = Number(this.get(userId, currency).balance_minor);
+      let delta: number;
+      if (mode === 'add') delta = amountMinor;
+      else if (mode === 'subtract') delta = -amountMinor;
+      else delta = amountMinor - current;
+      if (delta > 0) {
+        this.credit(userId, currency, delta, { kind: 'admin_adjustment', note: opts.reason });
+      } else if (delta < 0) {
+        this.debit(userId, currency, -delta, { kind: 'admin_adjustment', note: opts.reason });
+      }
       recordAudit(this.db, {
-        actorUserId,
+        actorUserId: opts.actorUserId,
         actorRole: 'admin',
         action: 'admin.wallet_adjusted',
         targetType: 'wallet',
         targetId: userId,
-        meta: { currency, deltaMinor, reason },
-        ip: ip ?? null,
+        meta: { currency, mode, amountMinor, delta, reason: opts.reason, before: current },
+        ip: opts.ip ?? null,
         now,
       });
     });
     return this.viewOf(userId, currency);
   }
 
-  private viewOf(userId: string, currency: Currency): WalletView {
+  viewOf(userId: string, currency: Currency): WalletView {
     const minor = Number(this.get(userId, currency).balance_minor);
     return { currency, balanceMinor: minor, balance: toMajor(minor, currency) };
   }

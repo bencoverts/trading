@@ -12,7 +12,7 @@ export type Timeframe = keyof typeof TIME_FRAMES;
 export const TIMEFRAME_LIST = Object.keys(TIME_FRAMES) as Timeframe[];
 
 /** Durations offered in the UI and accepted by the server (seconds). */
-export const DURATION_PRESETS = [5, 10, 15, 30, 60, 300, 900, 1_800, 3_600, 7_200, 14_400, 28_800] as const;
+export const DURATION_PRESETS = [5, 10, 15, 30, 60, 120, 300, 900, 1_800, 3_600, 7_200, 14_400, 28_800] as const;
 export const MIN_DURATION_SEC = 5;
 export const MAX_DURATION_SEC = 28_800;
 
@@ -36,3 +36,21 @@ export type TradeResult = 'win' | 'lose' | 'draw';
 
 /** UI copy that must also appear in API payloads. */
 export const SIMULATION_LABEL = 'SIMULASI';
+
+export const MARKET_CATEGORIES = ['index', 'crypto', 'forex', 'komoditas', 'lainnya'] as const;
+export type MarketCategory = (typeof MARKET_CATEGORIES)[number];
+
+export const VOLATILITY_PRESETS = {
+  rendah: { label: 'Rendah', multiplier: 0.5 },
+  sedang: { label: 'Sedang', multiplier: 1 },
+  tinggi: { label: 'Tinggi', multiplier: 1.8 },
+  ekstrem: { label: 'Ekstrem', multiplier: 3 },
+} as const;
+export type VolatilityPreset = keyof typeof VOLATILITY_PRESETS;
+export const VOLATILITY_PRESET_LIST = Object.keys(VOLATILITY_PRESETS) as VolatilityPreset[];
+
+export const MARKET_STATUSES = ['draft', 'active', 'paused', 'inactive'] as const;
+export type MarketStatus = (typeof MARKET_STATUSES)[number];
+
+export const LANGUAGES = ['id', 'en'] as const;
+export type Language = (typeof LANGUAGES)[number];

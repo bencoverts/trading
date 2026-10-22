@@ -128,7 +128,10 @@ export class SimulatedPriceFeed {
     this.momentum = this.momentum * decay + this.gauss() * preset.shock * Math.sqrt(step);
 
     const trendBias = this.trend === 'up' ? 1 : this.trend === 'down' ? -1 : 0;
-    const scale = this.tickSize * this.volatilityMultiplier;
+    // The step is price-relative so a $41k index and a $0.42 coin move by a
+    // comparable *percentage*; the configured tick size is the floor.
+    const relative = Math.max(this.tickSize, this.price * 0.00004);
+    const scale = relative * this.volatilityMultiplier;
     const delta = (this.momentum * preset.volatility + this.drift + trendBias * preset.trendStrength) * scale;
 
     this.price = Math.max(this.floor(), this.price + delta);

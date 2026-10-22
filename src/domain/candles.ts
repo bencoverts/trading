@@ -97,10 +97,7 @@ export class CandleAggregator {
     const byT = new Map<number, Candle>();
     for (const c of arr) byT.set(c.t, c);
     for (const c of candles) byT.set(c.t, { ...c });
-    this.history.set(
-      tf,
-      [...byT.values()].sort((a, b) => a.t - b.t).slice(-this.maxHistory),
-    );
+    this.history.set(tf, [...byT.values()].sort((a, b) => a.t - b.t).slice(-this.maxHistory));
   }
 
   prune(cutoff: number): number {
