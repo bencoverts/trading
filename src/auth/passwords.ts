@@ -25,3 +25,6 @@ export function createPasswordHasher(opts: { memoryCost: number; timeCost: numbe
     },
   };
 }
+
+/** Used by tests and dev tooling: a hash that works with the same verifier. */
+export const ARGON2_DEFAULTS = { memoryCost: 19_456, timeCost: 2 } as const;

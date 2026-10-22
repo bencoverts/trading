@@ -46,12 +46,14 @@ export class Database {
 
   constructor(path: string) {
     this.path = path;
+    // eslint-disable-next-line no-useless-assignment -- null is the fallback guard for the driver probe
     let raw: RawDatabase | null = null;
     let driver: 'better-sqlite3' | 'node:sqlite' = 'better-sqlite3';
 
     try {
       const BetterSqlite3 = require('better-sqlite3');
-      raw = new BetterSqlite3(path) as RawDatabase;
+      const better = new BetterSqlite3(path) as RawDatabase;
+      raw = better;
       raw.pragma?.('journal_mode = WAL');
       raw.pragma?.('foreign_keys = ON');
       raw.pragma?.('busy_timeout = 5000');

@@ -2,7 +2,8 @@ import jwt from 'jsonwebtoken';
 
 export interface SessionPayload {
   sub: string;
-  role: 'user' | 'admin';
+  /** server-side session id (registry row); revoking the row kills the token */
+  sid: string;
   /** token version - bumping it (logout everywhere / password change) revokes old tokens */
   v: number;
 }
@@ -15,7 +16,7 @@ export interface TokenService {
 export function createTokenService(secret: string, ttlSec: number): TokenService {
   return {
     sign(payload) {
-      return jwt.sign({ role: payload.role, v: payload.v }, secret, {
+      return jwt.sign({ v: payload.v, sid: payload.sid }, secret, {
         subject: payload.sub,
         expiresIn: ttlSec,
         algorithm: 'HS256',
@@ -25,12 +26,8 @@ export function createTokenService(secret: string, ttlSec: number): TokenService
     verify(token) {
       try {
         const decoded = jwt.verify(token, secret, { algorithms: ['HS256'], issuer: 'simulated-trading' });
-        if (typeof decoded === 'string' || !decoded.sub) return null;
-        return {
-          sub: String(decoded.sub),
-          role: decoded.role === 'admin' ? 'admin' : 'user',
-          v: Number(decoded.v ?? 0),
-        };
+        if (typeof decoded === 'string' || !decoded.sub || !decoded.sid) return null;
+        return { sub: String(decoded.sub), sid: String(decoded.sid), v: Number(decoded.v ?? 0) };
       } catch {
         return null;
       }

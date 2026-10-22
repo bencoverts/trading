@@ -88,6 +88,38 @@ export class PriceEngine {
     }
   }
 
+  /** Registers a market at runtime (admin creates one); no-op when it exists. */
+  addMarket(config: MarketConfig): void {
+    if (this.markets.has(config.symbol)) return;
+    const feed = new SimulatedPriceFeed({
+      initialPrice: config.basePrice,
+      tickSize: config.tickSize,
+      mood: config.mood,
+      trend: config.trend,
+      volatility: config.volatility,
+      rng: this.opts.rngFactory?.(config.symbol),
+    });
+    this.markets.set(config.symbol, {
+      config: { ...config },
+      feed,
+      candles: new CandleAggregator(TIME_FRAMES),
+      buffer: [],
+      seq: 0,
+      lastTick: null,
+      timer: null,
+      startedAt: null,
+    });
+    if (this.running) this.schedule(config.symbol);
+  }
+
+  /** Stops and forgets a market (soft-deleted by an admin). */
+  removeMarket(symbol: string): void {
+    const rt = this.markets.get(symbol);
+    if (!rt) return;
+    if (rt.timer) clearTimeout(rt.timer);
+    this.markets.delete(symbol);
+  }
+
   get symbols(): string[] {
     return [...this.markets.keys()];
   }
@@ -153,7 +185,8 @@ export class PriceEngine {
     const { updated, closed } = rt.candles.apply(price, t);
     this.events.emit('tick', tick);
     for (const u of updated) this.events.emit('candle', { market: symbol, tf: u.tf, candle: u.candle, seq: rt.seq });
-    for (const c of closed) this.events.emit('candle_closed', { market: symbol, tf: c.tf, candle: c.candle, seq: rt.seq });
+    for (const c of closed)
+      this.events.emit('candle_closed', { market: symbol, tf: c.tf, candle: c.candle, seq: rt.seq });
     return tick;
   }
 

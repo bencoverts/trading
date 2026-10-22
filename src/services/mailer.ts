@@ -27,7 +27,10 @@ export class DevMailer implements Mailer {
   send(message: MailMessage): void {
     this.messages.push(message);
     if (this.messages.length > 50) this.messages.shift();
-    this.logger.info({ to: message.to, subject: message.subject, link: message.link }, `[mail] ${message.subject}\n${message.body}`);
+    this.logger.info(
+      { to: message.to, subject: message.subject, link: message.link },
+      `[mail] ${message.subject}\n${message.body}`,
+    );
   }
 
   recent(): MailMessage[] {

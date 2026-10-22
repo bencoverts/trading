@@ -17,8 +17,29 @@ export interface RuntimeSettings {
   /** per-currency cap for one DEMO top-up, in minor units */
   topupMax: Record<Currency, number>;
   topupDailyCount: number;
+  /** seconds between two demo top-ups / resets */
+  topupCooldownSec: number;
+  resetCooldownSec: number;
   /** demo FX rates: units of currency per 1 USD */
   rates: Record<Currency, number>;
+  /** per-duration payout override (seconds -> rate); empty = use payoutRate */
+  payoutByDuration: Record<string, number>;
+  /** per-market USD exposure cap, in USD minor units */
+  globalMaxAmountUsdMinor: number;
+  maxOpenTradesPerUser: number;
+  tradeRateLimitPerMin: number;
+  loginRateLimitPerMin: number;
+  tickRetentionDays: number;
+  candleRetentionDays: number;
+  /** platform chrome */
+  platformName: string;
+  platformLogoPath: string | null;
+  faviconPath: string | null;
+  themeAccent: string;
+  disclaimer: string;
+  defaultLanguage: 'id' | 'en';
+  defaultTimezone: string;
+  platformTerms: string;
 }
 
 const KEY = 'runtime';
@@ -33,7 +54,26 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
   initialBalance: { USD: 100_000, IDR: 15_000_000, USDT: 100_000 },
   topupMax: { USD: 100_000, IDR: 10_000_000, USDT: 100_000 },
   topupDailyCount: 5,
+  topupCooldownSec: 30,
+  resetCooldownSec: 300,
   rates: { USD: 1, IDR: 16_000, USDT: 1 },
+  payoutByDuration: {},
+  globalMaxAmountUsdMinor: 200_000,
+  maxOpenTradesPerUser: 20,
+  tradeRateLimitPerMin: 20,
+  loginRateLimitPerMin: 20,
+  tickRetentionDays: 7,
+  candleRetentionDays: 90,
+  platformName: 'SimTrade Demo',
+  platformLogoPath: null,
+  faviconPath: null,
+  themeAccent: '#5b8cff',
+  disclaimer:
+    'SIMULASI / DEMO. Semua harga dihasilkan oleh server simulasi dan semua saldo adalah virtual. Ini bukan layanan investasi dan tidak ada uang sungguhan yang terlibat.',
+  defaultLanguage: 'id',
+  defaultTimezone: 'Asia/Jakarta',
+  platformTerms:
+    'Platform ini adalah demo teknis untuk tujuan edukasi. Tidak ada layanan investasi, tidak ada uang sungguhan, dan tidak ada jaminan hasil apa pun.',
 };
 
 /**
@@ -108,8 +148,43 @@ function normalize(input: RuntimeSettings): RuntimeSettings {
     maxAmount: { ...DEFAULT_SETTINGS.maxAmount },
     initialBalance: { ...DEFAULT_SETTINGS.initialBalance },
     topupMax: { ...DEFAULT_SETTINGS.topupMax },
-    topupDailyCount: Math.max(1, Math.round(Number(input.topupDailyCount))),
+    topupDailyCount: Math.max(1, Math.round(Number(input.topupDailyCount ?? DEFAULT_SETTINGS.topupDailyCount))),
+    topupCooldownSec: Math.max(0, Math.round(Number(input.topupCooldownSec ?? DEFAULT_SETTINGS.topupCooldownSec))),
+    resetCooldownSec: Math.max(0, Math.round(Number(input.resetCooldownSec ?? DEFAULT_SETTINGS.resetCooldownSec))),
     rates: { USD: 1, IDR: 16_000, USDT: 1 },
+    payoutByDuration: normalizeDurationRates(input.payoutByDuration),
+    globalMaxAmountUsdMinor: Math.max(
+      0,
+      Math.round(Number(input.globalMaxAmountUsdMinor ?? DEFAULT_SETTINGS.globalMaxAmountUsdMinor)),
+    ),
+    maxOpenTradesPerUser: Math.max(
+      1,
+      Math.round(Number(input.maxOpenTradesPerUser ?? DEFAULT_SETTINGS.maxOpenTradesPerUser)),
+    ),
+    tradeRateLimitPerMin: Math.max(
+      1,
+      Math.round(Number(input.tradeRateLimitPerMin ?? DEFAULT_SETTINGS.tradeRateLimitPerMin)),
+    ),
+    loginRateLimitPerMin: Math.max(
+      1,
+      Math.round(Number(input.loginRateLimitPerMin ?? DEFAULT_SETTINGS.loginRateLimitPerMin)),
+    ),
+    tickRetentionDays: Math.max(1, Math.round(Number(input.tickRetentionDays ?? DEFAULT_SETTINGS.tickRetentionDays))),
+    candleRetentionDays: Math.max(
+      1,
+      Math.round(Number(input.candleRetentionDays ?? DEFAULT_SETTINGS.candleRetentionDays)),
+    ),
+    platformName:
+      String(input.platformName ?? DEFAULT_SETTINGS.platformName).slice(0, 60) || DEFAULT_SETTINGS.platformName,
+    platformLogoPath: input.platformLogoPath ?? null,
+    faviconPath: input.faviconPath ?? null,
+    themeAccent: /^#[0-9a-fA-F]{6}$/.test(String(input.themeAccent))
+      ? String(input.themeAccent)
+      : DEFAULT_SETTINGS.themeAccent,
+    disclaimer: String(input.disclaimer ?? DEFAULT_SETTINGS.disclaimer).slice(0, 1000),
+    defaultLanguage: input.defaultLanguage === 'en' ? 'en' : 'id',
+    defaultTimezone: String(input.defaultTimezone ?? DEFAULT_SETTINGS.defaultTimezone),
+    platformTerms: String(input.platformTerms ?? DEFAULT_SETTINGS.platformTerms).slice(0, 5000),
   };
   for (const c of currencies) {
     if (input.minAmount?.[c] !== undefined) out.minAmount[c] = Math.round(Number(input.minAmount[c]));
@@ -141,4 +216,23 @@ function validate(s: RuntimeSettings): void {
     if (!(s.topupMax[c] > 0)) fail(`topupMax.${c} must be > 0`);
     if (!(s.rates[c] > 0)) fail(`rates.${c} must be > 0`);
   }
+  if (s.maxOpenTradesPerUser < 1) fail('maxOpenTradesPerUser minimal 1');
+  if (s.globalMaxAmountUsdMinor < 0) fail('globalMaxAmountUsdMinor tidak boleh negatif');
+  for (const [duration, rate] of Object.entries(s.payoutByDuration)) {
+    if (!Number.isInteger(Number(duration))) fail('payoutByDuration harus memakai durasi dalam detik');
+    if (!(rate >= 0 && rate <= 5)) fail('payout rate per durasi harus 0..5');
+  }
+}
+
+function normalizeDurationRates(input: Record<string, number> | undefined): Record<string, number> {
+  if (!input) return {};
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(input)) {
+    const duration = Math.round(Number(key));
+    const rate = Number(value);
+    if (!Number.isFinite(duration) || duration < MIN_DURATION_SEC || duration > MAX_DURATION_SEC) continue;
+    if (!Number.isFinite(rate) || rate < 0 || rate > 5) continue;
+    out[String(duration)] = rate;
+  }
+  return out;
 }
