@@ -11,13 +11,20 @@ export interface WalletRow {
   user_id: string;
   currency: Currency;
   balance_minor: number;
+  /** reserved by pending withdrawals; still part of the user's total */
+  locked_minor: number;
   updated_at: number;
 }
 
 export interface WalletView {
   currency: Currency;
+  /** total balance = available + locked */
   balanceMinor: number;
   balance: number;
+  lockedMinor: number;
+  locked: number;
+  availableMinor: number;
+  available: number;
 }
 
 export interface WalletServiceDeps {
@@ -59,9 +66,21 @@ export class WalletService {
     const rows = this.db.all<WalletRow>('SELECT * FROM wallets WHERE user_id = ?', userId);
     return CURRENCY_LIST.map((currency) => {
       const row = rows.find((r) => r.currency === currency);
-      const minor = Number(row?.balance_minor ?? 0);
-      return { currency, balanceMinor: minor, balance: toMajor(minor, currency) };
+      return this.viewOfRow(currency, Number(row?.balance_minor ?? 0), Number(row?.locked_minor ?? 0));
     });
+  }
+
+  private viewOfRow(currency: Currency, totalMinor: number, lockedMinor: number): WalletView {
+    const availableMinor = Math.max(0, totalMinor - lockedMinor);
+    return {
+      currency,
+      balanceMinor: totalMinor,
+      balance: toMajor(totalMinor, currency),
+      lockedMinor,
+      locked: toMajor(lockedMinor, currency),
+      availableMinor,
+      available: toMajor(availableMinor, currency),
+    };
   }
 
   /** Debit with the ledger entry. Must run inside the caller's transaction for atomicity. */
@@ -77,7 +96,7 @@ export class WalletService {
     const at = this.now();
     const result = this.db.run(
       `UPDATE wallets SET balance_minor = balance_minor - ?, updated_at = ?
-       WHERE user_id = ? AND currency = ? AND balance_minor >= ?`,
+       WHERE user_id = ? AND currency = ? AND balance_minor - locked_minor >= ?`,
       amountMinor,
       at,
       userId,
@@ -137,6 +156,135 @@ export class WalletService {
       now: at,
     });
     return balance;
+  }
+
+  /**
+   * Reserves part of the balance for a pending withdrawal. The total balance is
+   * unchanged, so the money is still visible to the user but cannot be spent.
+   * The ledger row is marked `affectsBalance: false`.
+   */
+  lockFunds(
+    userId: string,
+    currency: Currency,
+    amountMinor: number,
+    meta: { kind?: string; refType?: string; refId?: string; note?: string },
+  ): WalletView {
+    if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
+      throw AppError.badRequest('nominal harus bilangan bulat positif (minor unit)');
+    }
+    const at = this.now();
+    const result = this.db.run(
+      `UPDATE wallets SET locked_minor = locked_minor + ?, updated_at = ?
+        WHERE user_id = ? AND currency = ? AND balance_minor - locked_minor >= ?`,
+      amountMinor,
+      at,
+      userId,
+      currency,
+      amountMinor,
+    );
+    if (result.changes === 0) {
+      throw new AppError('INSUFFICIENT_AVAILABLE_FUNDS', 422, 'Saldo tersedia tidak cukup', {
+        currency,
+        requiredMinor: amountMinor,
+      });
+    }
+    const row = this.get(userId, currency);
+    this.deps.ledger.write({
+      userId,
+      currency,
+      kind: meta.kind ?? 'withdrawal_hold',
+      direction: 'debit',
+      amountMinor,
+      balanceAfterMinor: Number(row.balance_minor),
+      refType: meta.refType ?? null,
+      refId: meta.refId ?? null,
+      meta: { affectsBalance: false, lockedMinor: Number(row.locked_minor), ...(meta.note ? { note: meta.note } : {}) },
+      now: at,
+    });
+    return this.viewOf(userId, currency);
+  }
+
+  /** Releases a reservation (rejected/cancelled withdrawal). */
+  releaseFunds(
+    userId: string,
+    currency: Currency,
+    amountMinor: number,
+    meta: { kind?: string; refType?: string; refId?: string; note?: string },
+  ): WalletView {
+    if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
+      throw AppError.badRequest('nominal harus bilangan bulat positif (minor unit)');
+    }
+    const at = this.now();
+    const result = this.db.run(
+      `UPDATE wallets SET locked_minor = locked_minor - ?, updated_at = ?
+        WHERE user_id = ? AND currency = ? AND locked_minor >= ?`,
+      amountMinor,
+      at,
+      userId,
+      currency,
+      amountMinor,
+    );
+    if (result.changes === 0) {
+      throw new AppError('LOCK_MISMATCH', 409, 'Saldo terkunci tidak cocok; hubungi admin', { currency });
+    }
+    const row = this.get(userId, currency);
+    this.deps.ledger.write({
+      userId,
+      currency,
+      kind: meta.kind ?? 'withdrawal_hold_released',
+      direction: 'credit',
+      amountMinor,
+      balanceAfterMinor: Number(row.balance_minor),
+      refType: meta.refType ?? null,
+      refId: meta.refId ?? null,
+      meta: { affectsBalance: false, lockedMinor: Number(row.locked_minor), ...(meta.note ? { note: meta.note } : {}) },
+      now: at,
+    });
+    return this.viewOf(userId, currency);
+  }
+
+  /**
+   * Turns a reservation into a real debit (withdrawal completed). Balance and
+   * locked amount are reduced together, so available stays consistent.
+   */
+  settleLocked(
+    userId: string,
+    currency: Currency,
+    amountMinor: number,
+    meta: { kind?: string; refType?: string; refId?: string; note?: string },
+  ): WalletView {
+    if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
+      throw AppError.badRequest('nominal harus bilangan bulat positif (minor unit)');
+    }
+    const at = this.now();
+    const result = this.db.run(
+      `UPDATE wallets SET balance_minor = balance_minor - ?, locked_minor = locked_minor - ?, updated_at = ?
+        WHERE user_id = ? AND currency = ? AND locked_minor >= ? AND balance_minor >= ?`,
+      amountMinor,
+      amountMinor,
+      at,
+      userId,
+      currency,
+      amountMinor,
+      amountMinor,
+    );
+    if (result.changes === 0) {
+      throw new AppError('LOCK_MISMATCH', 409, 'Saldo terkunci tidak cocok; hubungi admin', { currency });
+    }
+    const row = this.get(userId, currency);
+    this.deps.ledger.write({
+      userId,
+      currency,
+      kind: meta.kind ?? 'withdrawal',
+      direction: 'debit',
+      amountMinor,
+      balanceAfterMinor: Number(row.balance_minor),
+      refType: meta.refType ?? null,
+      refId: meta.refId ?? null,
+      meta: { lockedMinor: Number(row.locked_minor), ...(meta.note ? { note: meta.note } : {}) },
+      now: at,
+    });
+    return this.viewOf(userId, currency);
   }
 
   /** Preview for the UI: payout of a conversion without applying it. */
@@ -329,7 +477,14 @@ export class WalletService {
   }
 
   viewOf(userId: string, currency: Currency): WalletView {
-    const minor = Number(this.get(userId, currency).balance_minor);
-    return { currency, balanceMinor: minor, balance: toMajor(minor, currency) };
+    const row = this.get(userId, currency);
+    return this.viewOfRow(currency, Number(row.balance_minor), Number(row.locked_minor ?? 0));
+  }
+
+  /** Total locked per currency across all users (finance dashboard). */
+  lockedTotals(): Array<{ currency: Currency; totalMinor: number }> {
+    return this.db.all<{ currency: Currency; totalMinor: number }>(
+      'SELECT currency, SUM(locked_minor) AS totalMinor FROM wallets GROUP BY currency',
+    );
   }
 }

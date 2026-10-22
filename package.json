@@ -1,8 +1,8 @@
 {
   "name": "simulated-trading-platform",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "Simulated (demo-only) multi-market trading platform: Node.js + SQLite + WebSocket + vanilla JS chart UI",
+  "description": "Simulated (demo) trading platform + KlikQRIS demo deposits, manual withdrawals and live chat: Node.js + SQLite + WebSocket + vanilla JS UI",
   "license": "MIT",
   "type": "module",
   "engines": {

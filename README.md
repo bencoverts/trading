@@ -1,21 +1,31 @@
-# SimTrade Demo — platform trading biner **simulasi**
+# SimTrade Demo — platform trading biner **simulasi** (v4)
 
 Satu server Node.js melayani API, feed WebSocket, dan UI browser. Harga dibuat
 oleh server simulasi sendiri, saldo sepenuhnya virtual, dan setiap halaman
 trading menampilkan label **SIMULASI / DEMO**.
 
-> **Tidak ada uang sungguhan.**
-> Tidak ada akun live, deposit, penarikan, QRIS, transfer bank, maupun payment
-> gateway. Modul `payments/` ada sebagai _seam_ arsitektur dan selalu menjawab
-> `501 NOT_AVAILABLE` (“belum tersedia”), dengan halaman “Segera hadir”.
-> Menjalankan platform derivatif dengan uang nyata memerlukan izin (di Indonesia:
+> **Tidak ada uang sungguhan — tetapi v4 menambah alur dana demo.**
+> Sejak v4 (lihat `docs/DECISIONS.md` §20) platform punya **deposit KlikQRIS
+> (demo)**, **deposit transfer manual** yang diverifikasi admin, **penarikan
+> demo** dengan saldo tertahan, **live chat**, dan **admin mata uang**. Semua
+> saldo tetap virtual dan `PaymentService.describe().liveMoney` selalu `false`.
+>
+> **Blocker yang harus dibaca sebelum mencoba QRIS:** algoritma signature
+> callback KlikQRIS tidak didefinisikan di dokumentasi yang tersedia. Build ini
+> hanya menerima HMAC-SHA256 `order_id|status|amount|merchant_id` dan
+> **menolak semua callback bila `KLIKQRIS_WEBHOOK_SECRET` kosong (fail closed)**.
+> Tanpa konfirmasi skema dari provider, deposit QRIS hanya bisa diselesaikan
+> lewat cek status, rekonsiliasi admin, atau deposit manual — lihat §23 di
+> `docs/DECISIONS.md`.
+>
+> Menjalankan derivatif beruang nyata memerlukan izin (di Indonesia:
 > Bappebti/OJK) — jangan arahkan kode ini ke dana nyata.
 
 - **Stack**: TypeScript, Express, SQLite (WAL, FK, migrasi, seed), `ws`, zod,
   pino (redaksi), canvas chart tanpa dependency.
 - **Bahasa**: Indonesia default, English tersedia (i18n dua kamus).
-- **Tes**: 166 tes otomatis (unit + integrasi), 8 skenario Playwright (belum
-  dijalankan di sandbox ini — lihat `docs/TEST-REPORT.md`).
+- **Tes**: 219 tes otomatis (unit + integrasi) lulus; spesifikasi Playwright
+  belum dijalankan di sandbox ini (lihat `docs/TEST-REPORT.md`).
 
 ---
 
@@ -36,6 +46,16 @@ Akun seed (dev):
 | user demo   | `demo@simtrade.local`     | `demo-password-123` |
 | support     | `support@simtrade.local`  | `support-demo-123`  |
 | operator    | `operator@simtrade.local` | `operator-demo-123` |
+| finance     | `finance@simtrade.local`  | `finance-demo-123`  |
+
+Peran `finance` (baru di v4) memegang review deposit, proses penarikan, mata
+uang, dan rekonsiliasi; `operator` tetap fokus market/trade. Matriks lengkap
+ada di `docs/ADMIN_GUIDE.md` dan halaman **Admin → Peran & izin**.
+
+Halaman utama: `/` (landing; pengguna login otomatis diarahkan ke `/platform`),
+`/platform`, `/dashboard`, `/trading`, `/deposit`, `/withdraw`, `/transactions`,
+`/history`, `/order-history`, `/account`, `/profile-security`, `/live-chat`,
+`/payment-status`, `/notifications`, `/adminpages` (alias `/admin`).
 
 Market awal: `ASIA_COMPOSITE` (indeks fiktif), `CRYPTO_COMPOSITE` (keranjang
 kripto fiktif), `DOGE` = **Dogecoin (simulasi)**.
@@ -99,9 +119,25 @@ Docker/PM2: `docker compose up --build`, atau `npm run build && pm2 start ecosys
 
 **Dompet demo**
 
-- USD, IDR, USDT; saldo awal diatur admin; kurs demo; setiap konversi tercatat;
-  mata uang terkunci saat ada trade terbuka; “Top-up Demo” dan “Reset Saldo
-  Demo” dengan batas + cooldown; semua di ledger.
+- IDR, USD, USDT; **IDR aktif secara default**, USD/USDT nonaktif untuk dana
+  sampai admin mengaktifkan beserta aturannya (menonaktifkan tidak menghapus
+  saldo). Saldo awal diatur admin; kurs demo + **sumber kurs** wajib tercatat;
+  setiap konversi masuk ledger; mata uang terkunci saat ada trade terbuka;
+  “Top-up Demo” dan “Reset Saldo Demo” dengan batas + cooldown.
+
+**Dana demo (v4)**
+
+- **Deposit QRIS (KlikQRIS)**: invoice server-side, `total_amount` + kode unik
+  ditampilkan, status hanya berubah setelah verifikasi server/callback; cek
+  status (cooldown 3 s) dan rekonsiliasi tersedia.
+- **Deposit manual**: referensi transfer unik, masuk antrian `review`, admin
+  menyetujui/menolak dengan alasan; kredit idempoten + satu baris ledger.
+- **Penarikan**: `quote` biaya → dana **ditahan** (`locked_minor`), admin
+  memproses `approve → process → complete` (wajib referensi transfer) atau
+  `reject`; batal/reject melepas hold tepat sekali; nomor tujuan disamarkan.
+- **Live chat** dengan staf (pesan idempoten, catatan internal, status &
+  prioritas), plus notifikasi dan event WebSocket.
+- **Feature flag** & **mode maintenance** yang bisa diubah admin tanpa deploy.
 
 **Admin**
 
@@ -118,8 +154,10 @@ Docker/PM2: `docker compose up --build`, atau `npm run build && pm2 start ecosys
   disclaimer/terms, bahasa/timezone.
 - Konten: banner terjadwal, editor halaman + pratinjau.
 - Sistem: health, job, backup SQLite (list/unduh), log berfilter, audit + ekspor.
-- Pembayaran: placeholder “Segera hadir”. Matriks peran: `super_admin`,
-  `operator`, `support`, `viewer` — dicek di server pada setiap endpoint.
+- Antrian deposit & penarikan, mata uang (aktif/limit/biaya/kurs), situs &
+  feature flag, inbox live chat, status provider + tes koneksi + rekonsiliasi.
+- Matriks peran: `super_admin`, `operator`, `finance`, `support`, `viewer` —
+  dicek di server pada setiap endpoint (menu tersembunyi bukan keamanan).
 
 **Keamanan**
 
@@ -152,14 +190,19 @@ src/
   http/                 express app, session/CSRF, validasi
   jobs/                 scheduler, backup, cleanup
   price/                price engine + simulated feed
-  routes/               auth, account, market, trades, admin, content, payments
-  services/             users, wallets, ledger, markets, trades, settlement, …
-  ws/                   protokol + server realtime
-public/                 index.html, css/app.css, js/{app,router,store,api,ui,ws,chart,i18n}.js, js/pages/*
-migrations/sqlite/      001_init.sql, 002_v3.sql
+  payments/             klikqris.ts (server-side client) + service.ts (facade)
+  routes/               auth, account, market, trades, admin, adminV4, content,
+                        finance, chat, webhooks, payments (stub v3)
+  services/             users, wallets, ledger, markets, trades, settlement,
+                        currencies, deposits, withdrawals, chat, site, …
+  ws/                   protokol + server realtime (sendToUser/sendToStaff)
+public/                 index.html, css/app.css, js/{app,router,store,api,ui,ws,chart,i18n}.js,
+                        js/pages/{home,trading,platform,finance,chat,history,account,notifications,auth,content,admin}.js
+migrations/sqlite/      001_init.sql, 002_v3.sql, 003_v4.sql
 test/                   unit/, integration/, load/
-e2e/                    Playwright
-docs/                   API, ARCHITECTURE, ADMIN_GUIDE, DECISIONS, CHANGELOG, TEST-REPORT
+e2e/                    Playwright (smoke + v4)
+docs/                   API, ARCHITECTURE, ADMIN_GUIDE, DECISIONS, CHANGELOG, TEST-REPORT, openapi.yaml
+update.md               log rilis per versi (wajib, lihat root repo)
 ```
 
 Arsitektur (termasuk diagram tick → candle → chart dan trade → settlement) ada
@@ -170,15 +213,30 @@ di `docs/ARCHITECTURE.md`. Kontrak API + WebSocket: `docs/API.md` dan
 
 ## 4. Batasan yang disengaja
 
-| Area                                                             | Status                                                                      |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Akun live, deposit, penarikan, QRIS, bank transfer, kartu        | **tidak diimplementasikan** (`501`, halaman “Segera hadir”)                 |
-| Panggilan ke pihak ketiga (bursa, data harga, email, pembayaran) | **tidak ada**; email ditulis ke log/dev link                                |
-| Uang sungguhan                                                   | **tidak ada**, semua saldo virtual                                          |
-| Admin mengubah hasil trade                                       | **tidak bisa**; hanya parameter simulasi, semuanya audited + riwayat publik |
-| Multi-instance                                                   | tidak didukung (SQLite + settlement in-process); jalankan 1 instance        |
+| Area                                           | Status                                                                      |
+| ---------------------------------------------- | --------------------------------------------------------------------------- |
+| Deposit/penarikan/QRIS                         | **demo**, v4; KlikQRIS dipanggil server-side, saldo virtual                 |
+| Callback KlikQRIS                              | **fail closed** sampai algoritma signature dikonfirmasi provider            |
+| Transfer dana nyata, kartu, akun live, KYC/AML | **tidak diimplementasikan**; `/payments/*` v3 tetap stub `NOT_AVAILABLE`    |
+| Panggilan pihak ketiga dari browser            | **tidak ada**; hanya server → KlikQRIS saat deposit/cek/rekonsiliasi        |
+| Uang sungguhan                                 | **tidak ada**, semua saldo virtual                                          |
+| Admin mengubah hasil trade                     | **tidak bisa**; hanya parameter simulasi, semuanya audited + riwayat publik |
+| Multi-instance                                 | tidak didukung (SQLite + settlement in-process); jalankan 1 instance        |
 
-Fase berikutnya (di luar §0) didokumentasikan di `docs/DECISIONS.md`.
+Konfigurasi v4 (opsional, semua lewat env — lihat `.env.example`):
+
+```bash
+PAYMENTS_ENABLED=false        # true hanya jika kredensial & skema signature sudah benar
+KLIKQRIS_API_KEY=             # server-side saja
+KLIKQRIS_MERCHANT_ID=
+KLIKQRIS_WEBHOOK_SECRET=      # kosong => semua callback ditolak (fail closed)
+KLIKQRIS_SIGNATURE_HEADER=x-callback-signature
+KLIKQRIS_CALLBACK_URL=https://<host-publik>/api/webhooks/klikqris
+```
+
+Tanpa kredensial, halaman deposit tetap dapat dipakai untuk **transfer manual**
+(diverifikasi admin) dan UI menandai QRIS sebagai “belum dikonfigurasi”.
+Keputusan & fase berikutnya ada di `docs/DECISIONS.md`.
 
 ---
 
@@ -186,10 +244,15 @@ Fase berikutnya (di luar §0) didokumentasikan di `docs/DECISIONS.md`.
 
 - `npm run typecheck` — bersih.
 - `npm run lint` — bersih.
-- `npm test` — **166 tes lulus** (15 file).
+- `npm test` — **219 tes lulus** (20 file), termasuk deposit/callback
+  signature fail-closed, penarikan hold/release, chat idempotensi, flag, dan
+  maintenance.
 - `npm run build` — sukses.
-- WebSocket load: **500 klien tersambung, 0 error**, ±9 900 pesan/detik,
-  delay tick p50 36 ms / p95 67 ms (lihat `docs/TEST-REPORT.md`).
+- `npm audit --omit=dev` — **0 kerentanan**; `npm audit` penuh mencatat 2
+  critical + 1 moderate yang hanya ada di rantai dev (vitest/tinypool) dan
+  perbaikannya butuh vitest 5 (breaking) — dilaporkan, tidak dipaksakan.
+- WebSocket load: **500 klien, 0 error**, ±9 600 pesan/detik, delay tick
+  p50 42 ms / p95 66 ms (lihat `docs/TEST-REPORT.md`).
 - Playwright E2E: spesifikasi selesai tetapi **belum dijalankan** karena unduhan
   browser diblokir di sandbox; hal ini dilaporkan apa adanya.
 

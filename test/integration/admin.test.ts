@@ -404,10 +404,13 @@ describe('system', () => {
     expect(String(auditCsv.text).split('\n')[0]).toContain('action');
   });
 
-  it('keeps the payments module disabled', async () => {
+  it('reports the KlikQRIS provider and never exposes its api key', async () => {
     const res = await admin.get('/api/v1/admin/payments');
     expect(res.status).toBe(200);
-    expect(res.body.enabled).toBe(false);
+    expect(res.body.provider.provider).toBe('klikqris');
+    expect(res.body.provider.liveMoney).toBe(false);
+    expect(JSON.stringify(res.body)).not.toContain(ctx.config.KLIKQRIS_API_KEY ?? 'never-set');
+    expect(typeof res.body.stats.callbacks).toBe('number');
   });
 
   it('writes every privileged action to the audit log', async () => {

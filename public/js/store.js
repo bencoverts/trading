@@ -10,7 +10,7 @@ const defaults = {
   platform: null,
   permissions: [],
   csrfToken: '',
-  displayCurrency: 'USD',
+  displayCurrency: 'IDR',
   theme: 'dark',
   language: 'id',
   connection: 'offline',

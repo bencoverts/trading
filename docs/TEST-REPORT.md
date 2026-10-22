@@ -7,22 +7,26 @@ tertulis, bukan perkiraan.
 
 ## Ringkasan
 
-| Pemeriksaan          | Perintah                            | Hasil                                              |
-| -------------------- | ----------------------------------- | -------------------------------------------------- |
-| Tes unit + integrasi | `npx vitest run`                    | **166 lulus / 166**, 15 file, 0 gagal, ~4,1 s      |
-| Typecheck            | `npm run typecheck`                 | bersih (0 diagnostik)                              |
-| Lint                 | `npx eslint .`                      | bersih (0 error, 0 warning)                        |
-| Build                | `npm run build`                     | sukses (`tsc` → `dist/`)                           |
-| Audit produksi       | `npm audit --omit=dev`              | **0 kerentanan**                                   |
-| Audit penuh          | `npm audit`                         | 3 (semua dev-only: vitest/tinypool)                |
-| E2E Playwright       | `npx playwright test`               | **tidak dijalankan** — browser tidak dapat diunduh |
-| Beban WebSocket      | `node test/load/ws-load.mjs 500 12` | 500 klien, 0 error                                 |
+| Pemeriksaan          | Perintah                            | Hasil                                                        |
+| -------------------- | ----------------------------------- | ------------------------------------------------------------ |
+| Tes unit + integrasi | `npx vitest run`                    | **219 lulus / 219**, 20 file, 0 gagal, ~6,2 s                |
+| Typecheck            | `npm run typecheck`                 | bersih (0 diagnostik)                                        |
+| Lint                 | `npx eslint .`                      | bersih (0 error, 0 warning)                                  |
+| Build                | `npm run build`                     | sukses (`tsc` → `dist/`)                                     |
+| Audit produksi       | `npm audit --omit=dev`              | **0 kerentanan**                                             |
+| Audit penuh          | `npm audit`                         | 3 (semua dev-only: vitest/tinypool; fix = vitest 5 breaking) |
+| E2E Playwright       | `npx playwright test`               | **tidak dijalankan** — browser tidak dapat diunduh           |
+| Beban WebSocket      | `node test/load/ws-load.mjs 500 12` | 500 klien, 0 error                                           |
 
 ```
-Test Files  15 passed (15)
-     Tests  166 passed (166)
-  Duration  3.85s
+Test Files  20 passed (20)
+     Tests  219 passed (219)
+  Duration  6.23s
 ```
+
+> v4 menambahkan 53 tes: klien KlikQRIS & signature, deposit QRIS/manual,
+> callback idempoten, penarikan hold/release, chat, feature flag, maintenance,
+> dan pemisahan peran market vs keuangan.
 
 ## Rincian per file
 
@@ -40,10 +44,46 @@ Test Files  15 passed (15)
 | integrasi — market API publik              | `test/integration/market-api.test.ts`  |      11 | lulus           |
 | integrasi — admin, audit, payments         | `test/integration/admin.test.ts`       |      23 | lulus           |
 | integrasi — akun & dompet demo             | `test/integration/account.test.ts`     |      14 | lulus           |
-| integrasi — akses per peran                | `test/integration/access.test.ts`      |       7 | lulus           |
+| integrasi — akses per peran                | `test/integration/access.test.ts`      |      10 | lulus           |
 | integrasi — WebSocket                      | `test/integration/ws.test.ts`          |       7 | lulus           |
-| integrasi — UI browser (jsdom)             | `test/integration/frontend.test.ts`    |       8 | lulus           |
-| **total**                                  | **15 file**                            | **166** | **semua lulus** |
+| integrasi — UI browser (jsdom)             | `test/integration/frontend.test.ts`    |      10 | lulus           |
+| unit — klien KlikQRIS & signature          | `test/unit/klikqris.test.ts`           |      10 | lulus           |
+| integrasi — deposit QRIS/manual & callback | `test/integration/deposits.test.ts`    |      13 | lulus           |
+| integrasi — penarikan & hold               | `test/integration/withdrawals.test.ts` |      11 | lulus           |
+| integrasi — live chat                      | `test/integration/chat.test.ts`        |       6 | lulus           |
+| integrasi — situs, flag, maintenance       | `test/integration/site.test.ts`        |       8 | lulus           |
+| **total**                                  | **20 file**                            | **219** | **semua lulus** |
+
+## v4 — apa yang diverifikasi
+
+- **Callback fail closed:** tanpa secret / signature salah → `401
+SIGNATURE_INVALID`, saldo **tidak** berubah; callback valid → saldo naik
+  tepat sekali; retry `paid` → `{duplicate:true}` tanpa kredit kedua; nominal
+  tidak cocok → `409 AMOUNT_MISMATCH`; order tak dikenal → `404` + tercatat di
+  `payment_callbacks`.
+- **Deposit manual:** `review` → approve → kredit sekali; approve kedua `409`;
+  reject wajib alasan dan tidak mengkredit; referensi duplikat `409`; di atas
+  batas `422`.
+- **Penarikan:** saldo tertahan (`locked_minor`) tanpa mengurangi total; tiga
+  pengajuan paralel dengan saldo terbatas hanya lolos sesuai available; cancel
+  dan reject melepas hold tepat sekali; complete mendebit sekali + menulis
+  `transferRef`; transisi ilegal `409`; nomor rekening tidak pernah muncul
+  mentah di respons.
+- **Peran:** `finance` boleh review deposit/proses penarikan/mata uang tetapi
+  tidak boleh menyentuh market; `operator` tidak melihat antrian dana; `viewer`
+  dan `support` tidak bisa approve deposit; `support` boleh chat & baca
+  pembayaran tetapi tidak `payments.write`.
+- **Feature flag & maintenance:** mematikan `deposits`/`live_chat` → `503`;
+  maintenance memblokir API publik `503` sementara `/auth`, `/site`, `/config`
+  dan staf tetap bekerja.
+- **Mata uang:** IDR tidak bisa dinonaktifkan; deaktivasi mematikan flag
+  turunan; USD/USDT nonaktif menolak penarikan (`CURRENCY_NOT_AVAILABLE` /
+  `CURRENCY_INACTIVE`); kurs negatif ditolak `400`.
+- **UI (jsdom):** landing, trading (chart, 3 market, chip 5s/8j/maks/×2/½,
+  tombol BELI/JUAL), register → trading, modal konfirmasi → trade terbuka,
+  riwayat/akun/notifikasi/admin staf, dan modul v4 (`platform`, `finance`,
+  `chat`) dimuat; rute `/platform`, `/deposit`, `/withdraw`, `/live-chat`,
+  `/adminpages` ada di router.
 
 ## Apa yang benar-benar diverifikasi
 
@@ -175,12 +215,16 @@ Test Files  15 passed (15)
 | -------------------------- | -------------------------- |
 | Klien diminta / tersambung | 500 / **500**              |
 | Error handshake/pesan      | **0**                      |
-| Pesan diterima             | 122 000 (~**9 990/detik**) |
-| Delay tick p50 / p95 / max | **36 ms / 67 ms / 71 ms**  |
-| Waktu koneksi p50          | 161 ms                     |
+| Pesan diterima             | 118 500 (~**9 601/detik**) |
+| Tick diterima              | 58 500                     |
+| Delay tick p50 / p95 / max | **42 ms / 66 ms / 79 ms**  |
+| Waktu koneksi p50 / max    | 256 ms / 330 ms            |
 | RSS server                 | 86 MB                      |
 
-Server uji dihentikan setelah run; file `data/loadtest.sqlite*` dihapus.
+Dijalankan pada v4 terhadap server `tsx` lokal (port 3211, database
+`data/smoke.sqlite`, 3 market, `PAYMENTS_ENABLED=true` dengan kredensial
+palsu). Angka v3 sebelumnya (9 990/detik, p95 67 ms) tetap dapat direproduksi;
+perbedaan kecil berasal dari beban mesin, bukan regresi.
 
 ## `npm audit`
 

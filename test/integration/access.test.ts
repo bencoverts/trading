@@ -85,4 +85,49 @@ describe('role matrix', () => {
     const after = await viewer.client.get('/api/v1/admin/dashboard');
     expect(after.status).toBe(401);
   });
+
+  it('separates market administration from finance work', async () => {
+    const finance = await createStaffUser(ctx, 'finance');
+    const operator = await createStaffUser(ctx, 'operator');
+
+    // finance can read money queues but not touch markets
+    expect((await finance.client.get('/api/v1/admin/deposits?status=all')).status).toBe(200);
+    expect((await finance.client.get('/api/v1/admin/withdrawals?status=all')).status).toBe(200);
+    expect((await finance.client.post('/api/v1/admin/markets/DOGE/simulate', { mood: 'normal' })).status).toBe(403);
+
+    // operators keep their market powers and cannot process withdrawals
+    expect((await operator.client.get('/api/v1/admin/deposits?status=all')).status).toBe(403);
+    expect((await operator.client.patch('/api/v1/admin/currencies/IDR', { active: false })).status).toBe(403);
+  });
+
+  it('blocks viewer and support from reviewing deposits', async () => {
+    const viewer = await createStaffUser(ctx, 'viewer');
+    const support = await createStaffUser(ctx, 'support');
+    const user = await registerUser(ctx);
+    const created = await user.client.post('/api/v1/deposits/manual', {
+      currency: 'IDR',
+      amount: 20_000,
+      reference: `ACC-${Math.random().toString(36).slice(2, 8)}`,
+    });
+    expect(created.status).toBe(201);
+    const id = created.body.deposit.id as string;
+    for (const staff of [viewer, support]) {
+      const res = await staff.client.post(`/api/v1/admin/deposits/${id}/review`, { action: 'approve' });
+      expect(res.status).toBe(403);
+    }
+    const finance = await createStaffUser(ctx, 'finance');
+    const ok = await finance.client.post(`/api/v1/admin/deposits/${id}/review`, { action: 'approve' });
+    expect(ok.status).toBe(200);
+  });
+
+  it('gives support chat access without money permissions', async () => {
+    const support = await createStaffUser(ctx, 'support');
+    expect((await support.client.get('/api/v1/admin/chat')).status).toBe(200);
+    // read-only payment visibility is fine for support, writes are not
+    expect((await support.client.get('/api/v1/admin/payments')).status).toBe(200);
+    expect((await support.client.post('/api/v1/admin/payments/test-connection', {})).status).toBe(403);
+    expect(
+      (await support.client.post('/api/v1/admin/withdrawals/unknown/transition', { action: 'approve' })).status,
+    ).toBe(403);
+  });
 });

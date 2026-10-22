@@ -99,7 +99,7 @@ describe('public market API', () => {
     const res = await ctx.api().get('/api/v1/config');
     expect(res.status).toBe(200);
     expect(res.body.durations.allowed).toContain(5);
-    expect(res.body.features.deposits).toBe(false);
+    expect(res.body.features.deposits).toBe(true);
     expect(res.body.platform.name).toBeTruthy();
     expect(res.body.volatilityPresets.ekstrem.multiplier).toBe(3);
   });
@@ -124,10 +124,11 @@ describe('public market API', () => {
     expect(banners.status).toBe(200);
   });
 
-  it('reports payments as not available and never exposes deposit endpoints', async () => {
+  it('reports the legacy payments surface as retired and keeps /payments/* stubbed', async () => {
     const res = await ctx.api().get('/api/v1/payments/methods');
     expect(res.status).toBe(200);
     expect(res.body.enabled).toBe(false);
+    expect(res.body.provider).toBe('klikqris');
     const attempt = await ctx
       .api()
       .post('/api/v1/payments/deposit')

@@ -81,6 +81,24 @@ const schema = z.object({
 
   SETTLE_INTERVAL_MS: int(250, 20),
   TEST_SETTLE_INTERVAL_MS: int(100, 10),
+
+  /**
+   * KlikQRIS. Secrets come from the environment only and are never echoed to
+   * the browser or the logs. Without an API key + merchant id the integration
+   * reports `configured: false` and refuses to create transactions instead of
+   * pretending a payment succeeded.
+   */
+  KLIKQRIS_BASE_URL: z.string().url().default('https://klikqris.com/api'),
+  KLIKQRIS_API_KEY: z.string().min(8).optional(),
+  KLIKQRIS_MERCHANT_ID: z.string().min(1).optional(),
+  KLIKQRIS_CALLBACK_URL: z.string().url().optional(),
+  /** HMAC-SHA256 secret used to verify callbacks (confirm the scheme with the provider) */
+  KLIKQRIS_WEBHOOK_SECRET: z.string().min(16).optional(),
+  /** signature header sent by the provider; configurable because the API docs must be confirmed */
+  KLIKQRIS_SIGNATURE_HEADER: z.string().default('x-callback-signature'),
+  KLIKQRIS_TIMEOUT_MS: int(15_000, 1000, 60_000),
+  /** allow deposits/withdrawals in this build; false keeps the demo wallet only */
+  PAYMENTS_ENABLED: bool(false),
 });
 
 export type Config = ReturnType<typeof loadConfig>;
@@ -117,6 +135,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     APP_VERSION: process.env.npm_package_version ?? '3.0.0',
     SQLITE_PATH: sqlitePath,
     DB_PATH: sqlitePath,
+    PAYMENTS_CONFIGURED: Boolean(e.KLIKQRIS_API_KEY && e.KLIKQRIS_MERCHANT_ID && e.KLIKQRIS_WEBHOOK_SECRET),
     DATA_DIR: sqlitePath === ':memory:' ? process.cwd() : path.dirname(sqlitePath),
     PUBLIC_URL: e.APP_PUBLIC_URL,
     UPLOADS_DIR: absolute(e.UPLOADS_DIR),

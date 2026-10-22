@@ -1,23 +1,17 @@
+import type { KlikQrisClient } from './klikqris.js';
+
 /**
- * Payments module - intentionally a stub.
+ * Payments facade.
  *
- * Real money is out of scope for this build: there is no deposit, withdrawal,
- * QRIS, bank transfer or payment-gateway integration. The interfaces below are
- * the seams where those features will be implemented later, so adding them does
- * not require restructuring the app.
+ * The real integration lives in `kliqris.ts` + `DepositService`; this class only
+ * exposes a safe, secret-free summary for the UI/admin panel and keeps the
+ * legacy `/payments/*` stub endpoints honest (they still return 501 and point at
+ * the working `/deposits` + `/withdrawals` endpoints).
  */
 export interface PaymentProvider {
   readonly id: string;
   readonly label: string;
   readonly methods: Array<'qris' | 'bank_transfer' | 'card' | 'crypto'>;
-  isAvailable(): boolean;
-}
-
-export interface DepositRequest {
-  userId: string;
-  currency: string;
-  amountMinor: number;
-  method: string;
 }
 
 export interface PaymentResult {
@@ -25,45 +19,74 @@ export interface PaymentResult {
   message: string;
 }
 
-/** Placeholder implementation: every real-money operation is unavailable. */
 export class PaymentService {
   readonly providers: PaymentProvider[] = [
-    {
-      id: 'qris',
-      label: 'QRIS (not available)',
-      methods: ['qris'],
-      isAvailable: () => false,
-    },
-    {
-      id: 'bank_transfer',
-      label: 'Bank transfer (not available)',
-      methods: ['bank_transfer'],
-      isAvailable: () => false,
-    },
-    {
-      id: 'withdraw',
-      label: 'Withdrawal (not available)',
-      methods: ['bank_transfer', 'crypto'],
-      isAvailable: () => false,
-    },
+    { id: 'klikqris', label: 'QRIS via KlikQRIS', methods: ['qris'] },
+    { id: 'manual_transfer', label: 'Transfer manual (review admin)', methods: ['bank_transfer'] },
+    { id: 'bank_withdrawal', label: 'Penarikan bank/e-wallet (proses admin)', methods: ['bank_transfer'] },
   ];
 
-  listProviders(): Array<Omit<PaymentProvider, 'isAvailable'> & { available: boolean; reason: string }> {
-    return this.providers.map((p) => ({
-      id: p.id,
-      label: p.label,
-      methods: p.methods,
-      available: p.isAvailable(),
-      reason: 'Live accounts and real-money payments are not implemented in this simulation-only build.',
+  constructor(
+    private readonly client: KlikQrisClient,
+    private readonly flags: { depositsEnabled: boolean; withdrawalsEnabled: boolean },
+  ) {}
+
+  /** Safe provider status: never includes the API key or the full merchant id. */
+  describe(): {
+    configured: boolean;
+    enabled: boolean;
+    provider: 'klikqris';
+    baseUrl: string;
+    merchantIdMasked: string | null;
+    callbackUrl: string | null;
+    signatureHeader: string;
+    webhookSecretSet: boolean;
+    apiKeySet: boolean;
+    depositsEnabled: boolean;
+    withdrawalsEnabled: boolean;
+    liveMoney: false;
+  } {
+    const safe = this.client.describe();
+    return {
+      configured: safe.configured,
+      enabled: this.flags.depositsEnabled,
+      provider: 'klikqris',
+      baseUrl: safe.baseUrl,
+      merchantIdMasked: safe.merchantIdMasked,
+      callbackUrl: safe.callbackUrl,
+      signatureHeader: safe.signatureHeader,
+      webhookSecretSet: safe.webhookSecretSet,
+      apiKeySet: safe.apiKeySet,
+      depositsEnabled: this.flags.depositsEnabled,
+      withdrawalsEnabled: this.flags.withdrawalsEnabled,
+      liveMoney: false,
+    };
+  }
+
+  listProviders(): Array<PaymentProvider & { available: boolean; reason: string }> {
+    const configured = this.client.configured;
+    return this.providers.map((provider) => ({
+      ...provider,
+      available: provider.id === 'klikqris' ? configured && this.flags.depositsEnabled : true,
+      reason:
+        provider.id === 'klikqris' && !configured
+          ? 'Kredensial KlikQRIS belum diisi; transaksi otomatis tidak dapat dibuat.'
+          : provider.id === 'klikqris'
+            ? 'Transaksi dibuat melalui API KlikQRIS oleh backend.'
+            : 'Diproses manual oleh admin finance dengan review bukti.',
     }));
   }
 
-  /** Both deposit and withdraw deliberately return the same "not available" result. */
+  /** Legacy endpoints: point callers at the working, auditable flows. */
   notAvailable(): PaymentResult {
     return {
       status: 'not_available',
       message:
-        'belum tersedia - real-money deposits and withdrawals are not implemented. Only the instant DEMO top-up (/api/v1/wallet/topup) exists in this build.',
+        'Endpoint lama ini tidak dipakai lagi. Gunakan /api/v1/deposits (KlikQRIS/manual) dan /api/v1/withdrawals.',
     };
+  }
+
+  async testConnection(): Promise<{ ok: boolean; message: string }> {
+    return this.client.testConnection();
   }
 }

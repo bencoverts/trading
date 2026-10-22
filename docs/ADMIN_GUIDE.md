@@ -210,3 +210,111 @@ kredensial, atau endpoint aktif. `POST /payments/deposit|withdraw` selalu
 | Backup gagal              | Cek `BACKUP_DIR` & izin tulis; jalankan backup manual                                                 |
 | Market harus berhenti     | `paused: true` (bukan hapus) agar riwayat tetap                                                       |
 | Kecurigaan penyalahgunaan | Blokir pengguna (mencabut sesi) + catatan + audit                                                     |
+
+---
+
+# Bagian v4 — deposit, penarikan, chat, mata uang
+
+> Semua saldo tetap **virtual**. Admin tidak pernah bisa mengubah hasil satu
+> trade; aksi v4 hanya menyentuh aliran dana demo dan konfigurasi.
+
+## Peran & izin
+
+| Peran         | Bisa                                                                 |
+| ------------- | -------------------------------------------------------------------- |
+| `super_admin` | semua, termasuk mengubah peran staf dan mengedit situs               |
+| `operator`    | market, trade, settle manual, konten; **tidak** melihat antrian dana |
+| `finance`     | review deposit, proses penarikan, mata uang, rekonsiliasi, ledger    |
+| `support`     | live chat, baca user/trade, baca status pembayaran (tanpa aksi uang) |
+| `viewer`      | read-only (tanpa mutasi apa pun)                                     |
+
+Matriks lengkap tampil di **Admin → Peran & izin** dan ditegakkan server-side.
+
+## 1. Antrian deposit
+
+`Admin → Deposit`
+
+1. Filter `review` untuk deposit **transfer manual**. Deposit QRIS tidak perlu
+   disentuh kecuali callback bermasalah.
+2. **Setujui** hanya setelah bukti transfer diverifikasi di luar sistem. Saldo
+   dikreditkan sekali; percobaan kedua dijawab `409`.
+3. **Tolak** wajib menyertakan alasan (muncul di riwayat pengguna + audit log).
+4. Detail deposit menampilkan semua callback yang pernah diterima, termasuk
+   yang ditolak (signature salah, nominal tidak cocok, order tidak dikenal).
+
+**Aturan:** jangan pernah menyetujui deposit QRIS secara manual tanpa
+memeriksa status di provider — kredit ganda mungkin terjadi jika callback
+datang kemudian. Sistem mencegahnya secara teknis, tetapi tetap salah praktik.
+
+## 2. Antrian penarikan
+
+`Admin → Penarikan`
+
+Alur: `pending → approve → process → complete` (atau `reject` kapan pun sebelum
+selesai).
+
+1. **approve** — setujui secara administratif.
+2. **process** — tandai sedang ditransfer (lakukan transfer demo di luar sistem).
+3. **complete** — wajib mengisi **referensi transfer**. Di titik ini saldo
+   tertahan didebit satu kali dan ledger mencatat `kind='withdrawal'`.
+4. **reject** — wajib alasan; dana yang tertahan dilepas kembali ke pengguna.
+
+Nomor rekening ditampilkan **tersamarkan**. Jangan meminta pengguna mengirim
+nomor lengkap lewat chat; gunakan form penarikan (data disimpan terenkripsi
+sebagai hash + masked).
+
+## 3. Mata uang
+
+`Admin → Mata uang`
+
+- IDR tidak dapat dinonaktifkan (mata uang dasar).
+- Menonaktifkan mata uang **tidak menghapus saldo**; semua flag turunan
+  (deposit/penarikan/trading) otomatis dimatikan.
+- Kurs wajib punya **sumber** (`fx_source`). Jangan mengisi kurs tebakan; ini
+  hanya nilai tampilan/konversi demo.
+- Limit & biaya penarikan: flat (`withdrawal_fee`) + basis poin
+  (`withdrawal_fee_bps`, maks 20%).
+
+## 4. Situs & feature flag
+
+`Admin → Situs & flag`
+
+- Branding, judul hero, dan pesan maintenance dapat diubah; setiap perubahan
+  diaudit (`admin.site_updated`).
+- **Maintenance** memblokir API publik dengan `503`, tetapi staf tetap bisa
+  login dan bekerja; `/auth`, `/site`, `/config`, `/healthz` tetap terbuka.
+- Flag: `deposits`, `withdrawals`, `live_chat`, `demo_topup`, `registrations`.
+  Mematikan flag membuat endpoint terkait menjawab `503 NOT_AVAILABLE` (bukan
+  500), dan navigasi UI menyesuaikan.
+
+## 5. Live chat inbox
+
+`Admin → Live chat`
+
+- Balas pesan pengguna; centang **Catatan internal** agar pesan tidak terlihat
+  pengguna (disaring server-side).
+- Ubah status (`open/pending/closed`) dan prioritas (`low/normal/high`).
+- Percakapan tertutup bersifat read-only bagi pengguna; mereka dapat memulai
+  percakapan baru.
+
+## 6. Pembayaran & rekonsiliasi
+
+`Admin → Pembayaran`
+
+- **Tes koneksi** melakukan panggilan server-side ke provider (tidak pernah
+  dari browser) dan melaporkan hasilnya.
+- **Rekonsiliasi** memeriksa invoice lokal yang masih `pending` terhadap
+  riwayat provider dan melaporkan transaksi yang hanya ada di provider.
+  Tidak ada kredit otomatis dari rekonsiliasi.
+- Status kredensial ditampilkan **masked** (`apiKeySet`, `merchantIdMasked`).
+
+### Blocker yang harus dibaca
+
+Signature callback KlikQRIS **belum terverifikasi** terhadap dokumentasi
+resmi. Build ini hanya menerima HMAC-SHA256
+`order_id|status|amount|merchant_id` dan menolak semua callback bila
+`KLIKQRIS_WEBHOOK_SECRET` kosong. Artinya, sampai skema dikonfirmasi:
+
+1. deposit QRIS hanya dapat diselesaikan lewat **cek status** (tombol “Cek
+   status” di halaman pengguna) atau **rekonsiliasi**; dan
+2. jangan mengaktifkan `PAYMENTS_ENABLED` pada data yang dianggap nyata.

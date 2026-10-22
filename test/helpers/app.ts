@@ -48,7 +48,13 @@ export interface TestContext {
  * and no listeners opened. Tests drive prices through `runtime.ctx.engine`.
  */
 export async function createTestApp(
-  opts: { env?: Record<string, string>; seed?: boolean; backfill?: boolean; demoData?: boolean } = {},
+  opts: {
+    env?: Record<string, string>;
+    seed?: boolean;
+    backfill?: boolean;
+    demoData?: boolean;
+    paymentTransport?: import('../../src/payments/klikqris.js').KlikQrisTransport;
+  } = {},
 ): Promise<TestContext> {
   const config = testConfig(opts.env);
   const clock = new FakeClock();
@@ -68,6 +74,7 @@ export async function createTestApp(
     backfill: opts.backfill ?? false,
     seed: opts.seed ?? true,
     demoData: opts.demoData ?? false,
+    paymentTransport: opts.paymentTransport,
   });
 
   const api = () => request(runtime.app) as unknown as request.SuperTest<request.Test>;

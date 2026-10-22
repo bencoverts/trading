@@ -1,16 +1,24 @@
 openapi: 3.1.0
 info:
   title: SimTrade Demo API
-  version: 3.0.0
+  version: 4.0.0
   description: |
-    SIMULATION-ONLY trading API. No real money, no deposits, no withdrawals and
-    no third-party integrations. Every market/trade payload contains
-    `simulation: true`; public payloads also carry `label: "SIMULASI"`.
-    Mutations need the double-submit CSRF header, trades also need an
-    `Idempotency-Key`.
+    SIMULATION-ONLY trading API. All balances are virtual. v4 adds **demo**
+    deposits (KlikQRIS + manual review), demo withdrawals with locked balances,
+    live chat, currency administration and feature flags — still no real money.
+
+    Every market/trade/money payload contains `simulation: true`; public
+    payloads also carry `label: "SIMULASI"`. Mutations need the double-submit
+    CSRF header, trades and money endpoints accept/require an `Idempotency-Key`.
+
+    Provider callbacks (`/api/webhooks/klikqris`) are signature-verified with
+    HMAC-SHA256 (`order_id|status|amount|merchant_id`); without
+    `KLIKQRIS_WEBHOOK_SECRET` every callback is rejected (fail closed).
 servers:
   - url: http://localhost:3000/api/v1
-    description: local development
+    description: local development (API)
+  - url: http://localhost:3000/api
+    description: provider callbacks
 tags:
   - name: public
   - name: auth
@@ -18,6 +26,9 @@ tags:
   - name: trades
   - name: admin
   - name: payments
+  - name: finance
+  - name: chat
+  - name: webhooks
 
 components:
   securitySchemes:
@@ -35,6 +46,11 @@ components:
       name: Idempotency-Key
 
   parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 8, maxLength: 128 }
     Symbol:
       name: symbol
       in: path
@@ -581,3 +597,373 @@ paths:
             application/json:
               example:
                 { enabled: false, status: not_available, message: 'Modul pembayaran belum tersedia', methods: [] }
+
+  # ---------------------------------------------------------------- v4 finance
+  /site:
+    get:
+      tags: [public]
+      summary: Public site config + feature flags
+      responses:
+        '200':
+          description: branding, SEO, maintenance state and flags
+          content:
+            application/json:
+              example:
+                branding: { name: SimTrade Demo, accent: '#5b8cff' }
+                maintenance: { enabled: false }
+                flags: { deposits: true, withdrawals: true, live_chat: true, demo_topup: true, registrations: true }
+                simulation: true
+
+  /currencies:
+    get:
+      tags: [public]
+      summary: Active and disabled currencies with limits and FX source
+      responses:
+        '200':
+          description: currency catalogue
+          content:
+            application/json:
+              example:
+                currencies:
+                  [
+                    {
+                      code: IDR,
+                      active: true,
+                      depositEnabled: true,
+                      withdrawalEnabled: true,
+                      tradingEnabled: true,
+                      minDeposit: 10000,
+                      maxDeposit: 10000000,
+                      withdrawalFee: 2500,
+                      fxRateToIdr: 1,
+                      fxSource: 'fixed:IDR',
+                    },
+                  ]
+                all: []
+                simulation: true
+
+  /deposits/methods:
+    get:
+      tags: [finance]
+      summary: Provider status (masked) and available deposit methods
+      responses:
+        '200':
+          description: methods + provider description
+
+  /deposits:
+    get:
+      tags: [finance]
+      summary: The signed-in user's deposits
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: list of deposits }
+    post:
+      tags: [finance]
+      summary: Create a KlikQRIS invoice (never credits before verification)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currency, amount]
+              properties:
+                currency: { type: string, enum: [IDR, USD, USDT] }
+                amount: { type: number, example: 50000 }
+      responses:
+        '201':
+          description: pending invoice with provider total_amount
+          content:
+            application/json:
+              example:
+                deposit:
+                  id: 7e32…
+                  orderId: DEP-…
+                  status: pending
+                  amount: 50000
+                  totalAmount: 50077
+                  uniqueAmount: 77
+                  qrisUrl: 'https://…'
+                  expiresAt: 1792684800000
+                reused: false
+        '200': { description: identical retry (reused true) }
+        '503': { description: PAYMENT_NOT_CONFIGURED or feature disabled }
+        '422': { description: AMOUNT_NOT_ALLOWED }
+
+  /deposits/manual:
+    post:
+      tags: [finance]
+      summary: Submit a manual transfer for admin review
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { currency: IDR, amount: 50000, reference: TRX-2026-0001, note: 'BCA a/n Demo' }
+      responses:
+        '201': { description: deposit in status review }
+        '409': { description: duplicate reference }
+
+  /deposits/{id}/check:
+    post:
+      tags: [finance]
+      summary: Ask the provider for the latest status (3 s cooldown)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: deposit with the current status }
+        '429': { description: cooldown / rate limited }
+
+  /withdrawals/quote:
+    get:
+      tags: [finance]
+      summary: Fee and net amount preview
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: currency, in: query, schema: { type: string, default: IDR } }
+        - { name: amount, in: query, required: true, schema: { type: number } }
+      responses:
+        '200': { description: amountMinor, feeMinor, netMinor }
+
+  /withdrawals:
+    get:
+      tags: [finance]
+      summary: The signed-in user's withdrawals
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: list of withdrawals }
+    post:
+      tags: [finance]
+      summary: Request a withdrawal (funds are locked, not debited)
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              currency: IDR
+              method: bank_transfer
+              amount: 100000
+              destination: { bank: BCA, accountNumber: '1234567890', accountName: 'Demo User' }
+      responses:
+        '201': { description: pending withdrawal + masked destination }
+        '422': { description: AMOUNT_NOT_ALLOWED / INSUFFICIENT_AVAILABLE_FUNDS }
+
+  /withdrawals/{id}/cancel:
+    post:
+      tags: [finance]
+      summary: Cancel a pending withdrawal and release the hold
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: cancelled }
+        '409': { description: no longer cancellable }
+
+  /transactions:
+    get:
+      tags: [finance]
+      summary: Ledger + deposits + withdrawals for the signed-in user
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 40 } }
+        - { name: currency, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [all, deposit, withdrawal, ledger] } }
+      responses:
+        '200': { description: ledger, deposits, withdrawals, wallets }
+
+  /chat:
+    get:
+      tags: [chat]
+      summary: Conversations of the signed-in user
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: conversations + enabled flag }
+    post:
+      tags: [chat]
+      summary: Start (or reopen) a conversation
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            example: { subject: 'Butuh bantuan deposit' }
+      responses:
+        '201': { description: conversation }
+
+  /chat/{id}/messages:
+    get:
+      tags: [chat]
+      summary: Messages of the user's own conversation
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: messages (internal notes filtered out) }
+        '403': { description: CHAT_FORBIDDEN }
+    post:
+      tags: [chat]
+      summary: Send a message (clientId makes retries idempotent)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            example: { body: 'Halo', clientId: 'msg-12345' }
+      responses:
+        '201': { description: message + conversation }
+
+  # ------------------------------------------------------------- v4 admin
+  /admin/currencies:
+    get:
+      tags: [admin]
+      summary: All currencies (requires finance.read)
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: currencies }
+
+  /admin/currencies/{code}:
+    patch:
+      tags: [admin]
+      summary: Update flags, limits, fees or the FX rate (requires currencies.write)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            example: { active: true, depositEnabled: true, fxRateToIdr: 16300, fxSource: 'demo:admin-2026-10' }
+      responses:
+        '200': { description: updated currency }
+        '400': { description: invalid limits/rate }
+
+  /admin/deposits:
+    get:
+      tags: [admin]
+      summary: Deposit queue (requires deposits.read)
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: items + stats }
+
+  /admin/deposits/{id}/review:
+    post:
+      tags: [admin]
+      summary: Approve (credits once) or reject a manual deposit
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { action: reject, reason: 'Bukti transfer tidak ditemukan' }
+      responses:
+        '200': { description: updated deposit }
+        '400': { description: reason required for reject }
+        '409': { description: already reviewed }
+
+  /admin/withdrawals:
+    get:
+      tags: [admin]
+      summary: Withdrawal queue (requires withdrawals.read)
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: items + stats }
+
+  /admin/withdrawals/{id}/transition:
+    post:
+      tags: [admin]
+      summary: review | approve | process | complete | reject
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { action: complete, transferRef: 'TRF-2026-0001' }
+      responses:
+        '200': { description: updated withdrawal }
+        '400': { description: transferRef/reason missing }
+        '409': { description: illegal transition }
+
+  /admin/payments:
+    get:
+      tags: [admin]
+      summary: Provider status (masked), stats and recent callbacks
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: provider + stats + callbacks }
+
+  /admin/payments/test-connection:
+    post:
+      tags: [admin]
+      summary: Server-side credential test (requires payments.write)
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '200': { description: ok }
+        '502': { description: provider rejected the credentials }
+
+  /admin/payments/reconcile:
+    post:
+      tags: [admin]
+      summary: Compare local pending invoices with provider history
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '200': { description: checked / providerOnly counts }
+
+  /admin/site:
+    get:
+      tags: [admin]
+      summary: Full site configuration + flags (requires settings.read)
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: site + flags }
+    patch:
+      tags: [admin]
+      summary: Update branding/landing/maintenance (requires site.write)
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '200': { description: updated site }
+        '400': { description: validation error }
+
+  /admin/site/flags/{key}:
+    patch:
+      tags: [admin]
+      summary: Toggle a feature flag (requires flags.write)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { enabled: false }
+      responses:
+        '200': { description: updated flags }
+        '400': { description: unknown flag }
+
+  # ------------------------------------------------------------ webhooks
+  /webhooks/klikqris:
+    post:
+      tags: [webhooks]
+      summary: Provider callback (HMAC verified, no session, no CSRF)
+      parameters:
+        - { name: x-callback-signature, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: { order_id: DEP-…, status: paid, total_amount: 50077 }
+      responses:
+        '200': { description: accepted (duplicate flag on retries) }
+        '401': { description: SIGNATURE_INVALID }
+        '404': { description: unknown order (still recorded) }
+        '409': { description: AMOUNT_MISMATCH }

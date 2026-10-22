@@ -32,7 +32,14 @@ export function accountRoutes(ctx: AppContext, requireAuth: RequestHandler, opti
       currency: w.currency,
       balance: w.balance,
       balanceMinor: w.balanceMinor,
-      display: w.balance,
+      locked: w.locked,
+      lockedMinor: w.lockedMinor,
+      available: w.available,
+      availableMinor: w.availableMinor,
+      display: w.available,
+      active: ctx.currencies.get(w.currency).active === 1,
+      depositEnabled: ctx.currencies.get(w.currency).deposit_enabled === 1,
+      withdrawalEnabled: ctx.currencies.get(w.currency).withdrawal_enabled === 1,
     }));
 
   const cooldowns = (userId: string) => {

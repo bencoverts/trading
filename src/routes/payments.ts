@@ -33,7 +33,8 @@ export function paymentRoutes(ctx: AppContext): Router {
       res.json({
         enabled: false,
         status: 'not_available',
-        message: 'Modul pembayaran belum tersedia',
+        message: 'Endpoint lama; gunakan /api/v1/deposits dan /api/v1/withdrawals',
+        provider: ctx.payments.describe().provider,
         methods: [],
         simulation: true,
         label: 'SIMULASI',
