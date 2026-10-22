@@ -1,6 +1,6 @@
 type Listener<A extends unknown[]> = (...args: A) => void;
 
-/** Tiny typed event emitter (avoid `any` leaking from node:events typing). */
+/** Minimal typed event emitter (kept tiny so the price loop has no overhead). */
 export class Emitter<Events extends { [K in keyof Events]: unknown[] }> {
   private listeners = new Map<keyof Events, Set<Listener<never[]>>>();
 
@@ -22,7 +22,7 @@ export class Emitter<Events extends { [K in keyof Events]: unknown[] }> {
       try {
         (fn as unknown as Listener<Events[K]>)(...args);
       } catch {
-        /* a broken listener must not break the price loop */
+        /* listener errors never break the caller */
       }
     }
   }

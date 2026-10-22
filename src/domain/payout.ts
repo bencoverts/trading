@@ -1,37 +1,29 @@
-export type Direction = 'up' | 'down';
-export type TradeResult = 'win' | 'lose' | 'draw';
+import type { Direction, TradeResult } from './constants.js';
+
 export type PayoutMode = 'profit' | 'total';
 
 /**
- * payout_mode:
- *  - "profit" (default): a winning trade returns stake + round(stake * rate).
- *    rate 0.85 means the trader profits 85% of the stake.
- *  - "total": a winning trade returns round(stake * rate) in total (rate must
- *    then be > 1, e.g. 1.85). House edge is explicit in the configuration.
- *
- * A losing trade returns 0; a draw refunds the stake in full.
+ * payoutMode = "profit" (default): a win returns stake + round(stake * rate)
+ *   → rate 0.85 means the trader profits 85% of the stake.
+ * payoutMode = "total": a win returns round(stake * rate) in total (rate > 1).
+ * A loss returns 0. A draw returns the stake (refund).
  */
-export function computePayoutCents(
-  amountCents: number,
-  rate: number,
-  mode: PayoutMode,
-  result: TradeResult,
-): number {
+export function computePayoutMinor(amountMinor: number, rate: number, mode: PayoutMode, result: TradeResult): number {
   if (result === 'lose') return 0;
-  if (result === 'draw') return amountCents;
-  if (mode === 'total') return Math.round(amountCents * rate);
-  return amountCents + Math.round(amountCents * rate);
+  if (result === 'draw') return amountMinor;
+  if (mode === 'total') return Math.round(amountMinor * rate);
+  return amountMinor + Math.round(amountMinor * rate);
 }
 
-/** Net profit of a winning trade (used for `payout` in API responses). */
-export function profitCents(amountCents: number, rate: number, mode: PayoutMode): number {
-  return computePayoutCents(amountCents, rate, mode, 'win') - amountCents;
+/** Net trader profit for a winning trade, in minor units. */
+export function profitMinor(amountMinor: number, rate: number, mode: PayoutMode): number {
+  return computePayoutMinor(amountMinor, rate, mode, 'win') - amountMinor;
 }
 
 /**
- * Compares the closing price against the entry price to decide the outcome.
- * Prices are quantised by the server, so equality is exact; a tiny epsilon is
- * still applied to avoid surprises from floating point serialisation.
+ * Compares close against entry.
+ * Prices are quantised by the server before comparison, so equality is exact;
+ * a tiny epsilon keeps float serialisation noise from flipping a result.
  */
 export function decideResult(direction: Direction, entryPrice: number, closePrice: number): TradeResult {
   const eps = 1e-9;
@@ -41,7 +33,6 @@ export function decideResult(direction: Direction, entryPrice: number, closePric
   return diff < 0 ? 'win' : 'lose';
 }
 
-/** Rounds a price to the configured number of decimals (server-side only). */
 export function quantizePrice(price: number, decimals: number): number {
   const f = 10 ** decimals;
   return Math.round(price * f) / f;

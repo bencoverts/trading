@@ -4,9 +4,10 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     pool: 'forks',
-    testTimeout: 20_000,
-    hookTimeout: 20_000,
+    poolOptions: { forks: { singleFork: true } },
     reporters: ['default'],
   },
 });

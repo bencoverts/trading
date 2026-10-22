@@ -2,7 +2,6 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { z, type ZodTypeAny } from 'zod';
 import { AppError } from '../lib/errors.js';
 
-/** Parses untrusted input, converting zod issues into a 400 AppError. */
 export function parseInput<T extends ZodTypeAny>(schema: T, data: unknown): z.infer<T> {
   const parsed = schema.safeParse(data);
   if (!parsed.success) {
@@ -14,13 +13,16 @@ export function parseInput<T extends ZodTypeAny>(schema: T, data: unknown): z.in
   return parsed.data;
 }
 
-/** Wraps async handlers so rejected promises reach the error middleware. */
-export function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): RequestHandler {
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown> | unknown,
+): RequestHandler {
   return (req, res, next) => {
-    fn(req, res, next).catch(next);
+    try {
+      Promise.resolve(fn(req, res, next)).catch(next);
+    } catch (err) {
+      next(err);
+    }
   };
 }
 
-export function clientIp(req: Request): string | null {
-  return req.ip ?? null;
-}
+export const clientIp = (req: Request): string | null => req.ip ?? null;

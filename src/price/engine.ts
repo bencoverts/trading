@@ -1,215 +1,257 @@
 import { CandleAggregator, type Candle } from '../domain/candles.js';
 import { quantizePrice } from '../domain/payout.js';
+import { TIME_FRAMES, type Mood, type TrendDirection } from '../domain/constants.js';
 import { Emitter } from '../lib/emitter.js';
-import type { Mood, PriceSource, Tick } from './types.js';
+import { SimulatedPriceFeed } from './simulated.js';
+
+export interface MarketConfig {
+  symbol: string;
+  name: string;
+  priceDecimals: number;
+  basePrice: number;
+  tickSize: number;
+  tickIntervalMs: number;
+  mood: Mood;
+  trend: TrendDirection;
+  volatility: number;
+  paused: boolean;
+}
+
+export interface Tick {
+  market: string;
+  seq: number;
+  price: number;
+  time: number;
+}
+
+export interface EngineEvents {
+  tick: [Tick];
+  candle: [{ market: string; tf: string; candle: Candle; seq: number }];
+  candle_closed: [{ market: string; tf: string; candle: Candle; seq: number }];
+}
+
+interface MarketRuntime {
+  config: MarketConfig;
+  feed: SimulatedPriceFeed;
+  candles: CandleAggregator;
+  buffer: Tick[];
+  seq: number;
+  lastTick: Tick | null;
+  timer: ReturnType<typeof setTimeout> | null;
+  startedAt: number | null;
+}
 
 export interface PriceEngineOptions {
-  symbol: string;
-  source: PriceSource;
-  timeframes: Record<string, number>;
-  /** price decimals; every price is quantised before it leaves the engine */
-  decimals: number;
-  /** poll interval for pull-mode sources */
-  intervalMs: number;
-  jitter?: boolean;
+  markets: MarketConfig[];
   bufferSize?: number;
   now?: () => number;
+  jitter?: boolean;
+  /** injectable RNG factory (tests) */
+  rngFactory?: (symbol: string) => () => number;
 }
 
-export interface PriceEngineEvents {
-  tick: [Tick];
-  candle: [{ tf: string; candle: Candle }];
-  candle_closed: [{ tf: string; candle: Candle }];
-}
+const MAX_BUFFER = 5_000;
 
 /**
- * Single source of truth for price in the whole application.
- *
- * The engine owns the clock: a tick's `time` is the server wall clock and is
- * never derived from a client. Every tick is written to a bounded ring buffer
- * (for seq-based resume) and folded into OHLC candles for all timeframes.
+ * One price engine for the whole process, one independent simulated source per
+ * market. Timestamps always come from the injected server clock.
  */
 export class PriceEngine {
-  readonly events = new Emitter<PriceEngineEvents>();
-  readonly symbol: string;
-  private readonly source: PriceSource;
-  private readonly aggregator: CandleAggregator;
-  private readonly decimals: number;
-  private readonly intervalMs: number;
-  private readonly jitter: boolean;
-  private readonly bufferSize: number;
+  readonly events = new Emitter<EngineEvents>();
+  private readonly markets = new Map<string, MarketRuntime>();
   private readonly now: () => number;
-  private readonly buffer: Tick[] = [];
-  private seq = 0;
-  private lastTick: Tick | null = null;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly jitter: boolean;
   private running = false;
-  private startedAt: number | null = null;
 
-  constructor(opts: PriceEngineOptions) {
-    this.symbol = opts.symbol;
-    this.source = opts.source;
-    this.decimals = opts.decimals;
-    this.intervalMs = opts.intervalMs;
-    this.jitter = opts.jitter ?? true;
-    this.bufferSize = opts.bufferSize ?? 20_000;
+  constructor(private readonly opts: PriceEngineOptions) {
     this.now = opts.now ?? Date.now;
-    this.aggregator = new CandleAggregator(opts.timeframes);
+    this.jitter = opts.jitter ?? true;
+    for (const config of opts.markets) {
+      const feed = new SimulatedPriceFeed({
+        initialPrice: config.basePrice,
+        tickSize: config.tickSize,
+        mood: config.mood,
+        trend: config.trend,
+        volatility: config.volatility,
+        rng: opts.rngFactory?.(config.symbol),
+      });
+      this.markets.set(config.symbol, {
+        config: { ...config },
+        feed,
+        candles: new CandleAggregator(TIME_FRAMES),
+        buffer: [],
+        seq: 0,
+        lastTick: null,
+        timer: null,
+        startedAt: null,
+      });
+    }
   }
 
-  async start(): Promise<void> {
+  get symbols(): string[] {
+    return [...this.markets.keys()];
+  }
+
+  has(symbol: string): boolean {
+    return this.markets.has(symbol);
+  }
+
+  getConfig(symbol: string): MarketConfig | undefined {
+    const rt = this.markets.get(symbol);
+    return rt ? { ...rt.config } : undefined;
+  }
+
+  listConfigs(): MarketConfig[] {
+    return [...this.markets.values()].map((m) => ({ ...m.config }));
+  }
+
+  start(): void {
     if (this.running) return;
     this.running = true;
-    this.startedAt = this.now();
-
-    if (this.source.start) {
-      // push-mode adapter (e.g. a real broker websocket)
-      await this.source.start({
-        emit: (price, time) => this.ingest(price, time),
-        now: this.now,
-      });
-      return;
-    }
-    if (!this.source.next) {
-      throw new Error(`Price source "${this.source.name}" implements neither next() nor start()`);
-    }
-    this.scheduleNext();
+    for (const symbol of this.markets.keys()) this.schedule(symbol);
   }
 
-  async stop(): Promise<void> {
+  stop(): void {
     this.running = false;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    for (const rt of this.markets.values()) {
+      if (rt.timer) clearTimeout(rt.timer);
+      rt.timer = null;
     }
-    await this.source.stop?.();
   }
 
-  /**
-   * Records one price observation. Used by push-mode adapters and by tests.
-   * `time` defaults to the server clock and is ignored if a client ever sends it.
-   */
-  ingest(rawPrice: number, time?: number): Tick {
+  private schedule(symbol: string): void {
+    const rt = this.markets.get(symbol);
+    if (!rt || !this.running) return;
+    const base = rt.config.tickIntervalMs;
+    const delay = this.jitter ? Math.max(10, Math.round(base * (0.75 + Math.random() * 0.5))) : base;
+    rt.timer = setTimeout(() => {
+      try {
+        if (!rt.config.paused) this.ingest(symbol, rt.feed.next(this.now()));
+      } catch {
+        /* a feed failure must not kill the loop */
+      }
+      this.schedule(symbol);
+    }, delay);
+    rt.timer.unref?.();
+  }
+
+  /** Records one price observation (also used by tests and push adapters). */
+  ingest(symbol: string, rawPrice: number, time?: number): Tick {
+    const rt = this.markets.get(symbol);
+    if (!rt) throw new Error(`Unknown market: ${symbol}`);
     if (!Number.isFinite(rawPrice) || rawPrice <= 0) {
-      throw new Error(`Invalid price from source "${this.source.name}": ${rawPrice}`);
+      throw new Error(`Invalid price for ${symbol}: ${rawPrice}`);
     }
     const t = typeof time === 'number' && Number.isFinite(time) ? time : this.now();
-    const price = quantizePrice(rawPrice, this.decimals);
-    const tick: Tick = { seq: ++this.seq, symbol: this.symbol, price, time: t };
+    const price = quantizePrice(rawPrice, rt.config.priceDecimals);
+    const tick: Tick = { market: symbol, seq: ++rt.seq, price, time: t };
 
-    this.buffer.push(tick);
-    if (this.buffer.length > this.bufferSize) this.buffer.splice(0, this.buffer.length - this.bufferSize);
-    this.lastTick = tick;
+    rt.buffer.push(tick);
+    if (rt.buffer.length > MAX_BUFFER) rt.buffer.splice(0, rt.buffer.length - MAX_BUFFER);
+    rt.lastTick = tick;
 
-    const { updated, closed } = this.aggregator.apply(price, t);
+    const { updated, closed } = rt.candles.apply(price, t);
     this.events.emit('tick', tick);
-    for (const u of updated) this.events.emit('candle', u);
-    for (const c of closed) this.events.emit('candle_closed', c);
-
+    for (const u of updated) this.events.emit('candle', { market: symbol, tf: u.tf, candle: u.candle, seq: rt.seq });
+    for (const c of closed) this.events.emit('candle_closed', { market: symbol, tf: c.tf, candle: c.candle, seq: rt.seq });
     return tick;
   }
 
-  private scheduleNext(): void {
-    if (!this.running) return;
-    const base = this.intervalMs;
-    const delay = this.jitter ? Math.max(10, Math.round(base * (0.75 + Math.random() * 0.5))) : base;
-    this.timer = setTimeout(() => {
-      try {
-        this.ingest((this.source.next as (now: number) => number)(this.now()));
-      } catch {
-        /* source failure must not kill the loop; next tick retries */
-      }
-      this.scheduleNext();
-    }, delay);
-    // do not keep the process alive only for the price loop
-    this.timer.unref?.();
+  lastPrice(symbol: string): number | null {
+    const rt = this.markets.get(symbol);
+    return rt?.lastTick ? rt.lastTick.price : null;
   }
 
-  /** Latest price (server-authoritative entry/close price for trades). */
-  getLastPrice(): number | null {
-    return this.lastTick ? this.lastTick.price : null;
+  lastTick(symbol: string): Tick | null {
+    const rt = this.markets.get(symbol);
+    return rt?.lastTick ? { ...rt.lastTick } : null;
   }
 
-  getLastTick(): Tick | null {
-    return this.lastTick ? { ...this.lastTick } : null;
+  lastSeq(symbol: string): number {
+    return this.markets.get(symbol)?.seq ?? 0;
   }
 
-  get lastSeq(): number {
-    return this.seq;
+  /**
+   * Price of the last tick at or before `time`. Returns null when the market has
+   * no data for that instant (the caller must then treat the outcome as unknown).
+   */
+  priceAt(symbol: string, time: number): number | null {
+    const rt = this.markets.get(symbol);
+    if (!rt) return null;
+    for (let i = rt.buffer.length - 1; i >= 0; i--) {
+      if (rt.buffer[i].time <= time) return rt.buffer[i].price;
+    }
+    return null;
   }
 
-  get startedAtMs(): number | null {
-    return this.startedAt;
-  }
-
-  /** Ticks after `seq` (for WS resume). */
-  getTicksSinceSeq(seq: number, limit = 5_000): Tick[] {
+  ticksSince(symbol: string, seq: number, limit = 1_000): Tick[] {
+    const rt = this.markets.get(symbol);
+    if (!rt) return [];
     const out: Tick[] = [];
-    for (let i = this.buffer.length - 1; i >= 0; i--) {
-      if (this.buffer[i].seq <= seq) break;
-      out.push({ ...this.buffer[i] });
+    for (let i = rt.buffer.length - 1; i >= 0; i--) {
+      if (rt.buffer[i].seq <= seq) break;
+      out.push({ ...rt.buffer[i] });
       if (out.length >= limit) break;
     }
     return out.reverse();
   }
 
-  /** Can a client resume from `seq`? (only if the gap is still buffered) */
-  canResumeFrom(seq: number): boolean {
-    if (seq >= this.seq) return true;
-    return this.buffer.length > 0 && this.buffer[0].seq <= seq + 1;
+  canResume(symbol: string, seq: number): boolean {
+    const rt = this.markets.get(symbol);
+    if (!rt) return false;
+    if (seq >= rt.seq) return true;
+    return rt.buffer.length > 0 && rt.buffer[0].seq <= seq + 1;
   }
 
-  /**
-   * Price of the last tick at or before `time` (server clock). Used to settle a
-   * trade at its exact expiry moment instead of "whenever the loop noticed".
-   */
-  getPriceAt(time: number): number | null {
-    for (let i = this.buffer.length - 1; i >= 0; i--) {
-      if (this.buffer[i].time <= time) return this.buffer[i].price;
-    }
-    return null;
-  }
-
-  getRecentTicks(limit = 500, sinceMs?: number): Tick[] {
-    const filtered = sinceMs === undefined ? this.buffer : this.buffer.filter((t) => t.time >= sinceMs);
+  recentTicks(symbol: string, limit = 500, since?: number): Tick[] {
+    const rt = this.markets.get(symbol);
+    if (!rt) return [];
+    const filtered = since === undefined ? rt.buffer : rt.buffer.filter((t) => t.time >= since);
     return filtered.slice(-limit).map((t) => ({ ...t }));
   }
 
-  getCurrentCandle(tf: string): Candle | undefined {
-    return this.aggregator.getCurrent(tf);
+  currentCandle(symbol: string, tf: string): Candle | undefined {
+    return this.markets.get(symbol)?.candles.getCurrent(tf);
   }
 
-  getCandles(tf: string, limit = 200, before?: number): Candle[] {
-    return this.aggregator.getHistory(tf, limit, before);
+  candles(symbol: string, tf: string, limit = 300, before?: number): Candle[] {
+    return this.markets.get(symbol)?.candles.getHistory(tf, limit, before) ?? [];
   }
 
-  getAllCurrentCandles(): Record<string, Candle | undefined> {
-    const out: Record<string, Candle | undefined> = {};
-    for (const tf of this.aggregator.timeframesList) out[tf] = this.aggregator.getCurrent(tf);
-    return out;
+  seedCandles(symbol: string, tf: string, candles: Candle[]): void {
+    this.markets.get(symbol)?.candles.seed(tf, candles);
   }
 
-  get timeframes(): string[] {
-    return this.aggregator.timeframesList;
+  /** Applies admin configuration to the live feed (trend, mood, volatility, pause). */
+  configure(symbol: string, patch: Partial<Pick<MarketConfig, 'mood' | 'trend' | 'volatility' | 'paused'>>): void {
+    const rt = this.markets.get(symbol);
+    if (!rt) return;
+    if (patch.mood !== undefined) {
+      rt.config.mood = patch.mood;
+      rt.feed.setMood(patch.mood);
+    }
+    if (patch.trend !== undefined) {
+      rt.config.trend = patch.trend;
+      rt.feed.setTrend(patch.trend);
+    }
+    if (patch.volatility !== undefined) {
+      rt.config.volatility = patch.volatility;
+      rt.feed.setVolatility(patch.volatility);
+    }
+    if (patch.paused !== undefined) rt.config.paused = patch.paused;
   }
 
-  seedHistory(tf: string, candles: Candle[]): void {
-    this.aggregator.seed(tf, candles);
+  setPrice(symbol: string, price: number): void {
+    this.markets.get(symbol)?.feed.setPrice(price);
   }
 
-  pruneHistory(cutoff: number): number {
-    return this.aggregator.prune(cutoff);
+  isPaused(symbol: string): boolean {
+    return this.markets.get(symbol)?.config.paused ?? true;
   }
 
-  setMood(mood: Mood): void {
-    this.source.setMood?.(mood);
-  }
-
-  setVolatility(multiplier: number): void {
-    this.source.setVolatility?.(multiplier);
-  }
-
-  describeSource(): Record<string, unknown> {
-    return this.source.describe?.() ?? { source: this.source.name };
+  describe(symbol: string): Record<string, unknown> {
+    const rt = this.markets.get(symbol);
+    if (!rt) return {};
+    return { ...rt.feed.describe(), paused: rt.config.paused, seq: rt.seq, lastPrice: rt.lastTick?.price ?? null };
   }
 }

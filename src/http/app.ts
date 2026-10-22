@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
@@ -8,11 +9,12 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import type { AppContext } from '../app/context.js';
 import { AppError } from '../lib/errors.js';
 import { createAuthMiddleware } from '../auth/middleware.js';
+import { marketRoutes } from '../routes/market.js';
 import { authRoutes } from '../routes/auth.js';
 import { accountRoutes } from '../routes/account.js';
 import { tradeRoutes } from '../routes/trades.js';
-import { marketRoutes } from '../routes/market.js';
 import { adminRoutes } from '../routes/admin.js';
+import { paymentRoutes } from '../routes/payments.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(here, '..', '..', 'public');
@@ -23,7 +25,6 @@ export function createApp(ctx: AppContext): express.Express {
   app.disable('x-powered-by');
   app.set('trust proxy', config.TRUST_PROXY ? 1 : false);
 
-  // --- security headers ----------------------------------------------------
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -37,13 +38,10 @@ export function createApp(ctx: AppContext): express.Express {
           objectSrc: ["'none'"],
           baseUri: ["'self'"],
           formAction: ["'self'"],
-          // allow embedding in the workspace preview iframe / any product shell
           frameAncestors: null,
-          // only force https upgrade in production; it would break ws:// in local dev
           upgradeInsecureRequests: config.isProd ? [] : null,
         },
       },
-      // the demo UI may be embedded in the workspace preview iframe
       frameguard: false,
       crossOriginEmbedderPolicy: false,
       crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -52,128 +50,140 @@ export function createApp(ctx: AppContext): express.Express {
     }),
   );
 
-  // --- CORS: explicit allowlist + same-host (reverse proxy / preview) ------
   app.use(
     cors({
-      origin(origin, callback) {
-        if (!origin) return callback(null, true); // non-browser clients
+      origin(origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+        if (!origin) return callback(null, true);
         if (config.CORS_ORIGINS.includes('*') || config.CORS_ORIGINS.includes(origin)) return callback(null, true);
         try {
           const host = new URL(origin).host;
-          const allowed = config.CORS_ORIGINS.some((o) => {
+          if (config.CORS_ORIGINS.some((o) => {
             try {
               return new URL(o).host === host;
             } catch {
               return false;
             }
-          });
-          if (allowed) return callback(null, true);
+          })) {
+            return callback(null, true);
+          }
         } catch {
           /* fall through */
         }
         return callback(null, false);
       },
-      credentials: false,
-      methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+      credentials: true,
+      methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
       exposedHeaders: ['Idempotency-Key', 'Idempotent-Replayed'],
       maxAge: 600,
     }),
   );
 
+  app.use(cookieParser());
   app.use(
     pinoHttp({
       logger,
-      autoLogging: { ignore: (req) => req.url === '/healthz' || req.url?.startsWith('/assets') === true },
+      autoLogging: { ignore: (req) => req.url === '/healthz' || Boolean(req.url?.startsWith('/assets')) },
       customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
       serializers: {
-        req: (req) => ({ method: req.method, url: req.url, remoteAddress: req.remoteAddress }),
-        res: (res) => ({ statusCode: res.statusCode }),
+        req: (req: { method?: string; url?: string; remoteAddress?: string }) => ({
+          method: req.method,
+          url: req.url,
+          remoteAddress: req.remoteAddress,
+        }),
+        res: (res: { statusCode?: number }) => ({ statusCode: res.statusCode }),
       },
     }),
   );
 
-  // --- health (outside the rate limit so probes always work) ---------------
-  app.get('/healthz', async (_req, res) => {
-    const startedAt = process.uptime();
+  const { requireAuth, requireAdmin } = createAuthMiddleware(ctx.tokens, ctx.users);
+
+  app.get('/healthz', (_req, res) => {
     let dbOk = true;
     try {
-      await ctx.db.get('SELECT 1 AS ok');
+      ctx.db.get('SELECT 1 AS ok');
     } catch {
       dbOk = false;
     }
-    const last = ctx.engine.getLastTick();
-    const body = {
+    const markets = ctx.engine.listConfigs().map((m) => ({
+      symbol: m.symbol,
+      lastPrice: ctx.engine.lastPrice(m.symbol),
+      lastSeq: ctx.engine.lastSeq(m.symbol),
+      paused: m.paused,
+    }));
+    res.status(dbOk ? 200 : 503).json({
       status: dbOk ? 'ok' : 'degraded',
+      simulation: true,
       serverTime: ctx.clock.now(),
-      uptimeSec: Math.round(startedAt),
+      uptimeSec: Math.round(process.uptime()),
       db: dbOk ? 'ok' : 'error',
-      engine: {
-        symbol: ctx.engine.symbol,
-        lastSeq: ctx.engine.lastSeq,
-        lastPrice: ctx.engine.getLastPrice(),
-        lastTickAgeMs: last ? ctx.clock.now() - last.time : null,
-        source: ctx.engine.describeSource(),
-      },
+      dbDriver: ctx.db.driver,
+      markets,
       realtime: { connections: ctx.realtime?.connectionCount ?? 0 },
-      version: process.env.npm_package_version ?? '1.0.0',
-    };
-    res.status(dbOk ? 200 : 503).json(body);
+      version: process.env.npm_package_version ?? '2.0.0',
+    });
   });
 
-  // --- api ----------------------------------------------------------------
-  app.use('/api', express.json({ limit: '32kb' }));
+  // --------------------------------------------------------------- API v1
+  const api = express.Router();
+  api.use(express.json({ limit: '64kb' }));
 
-  const globalLimiter = rateLimit({
-    windowMs: config.RATE_GLOBAL_WINDOW_MS,
-    limit: config.RATE_GLOBAL_MAX,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    passOnStoreError: true,
-    handler: (_req, res) =>
-      res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'Too many requests, slow down' } }),
-  });
+  const limiter = (
+    windowMs: number,
+    limit: number,
+    message: string,
+    keyGenerator?: (req: Request) => string,
+  ) =>
+    rateLimit({
+      windowMs,
+      limit,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      passOnStoreError: true,
+      keyGenerator,
+      handler: (_req, res) =>
+        res.status(429).json({ error: { code: 'RATE_LIMITED', message } }),
+    });
 
-  const authLimiter = rateLimit({
-    windowMs: config.RATE_AUTH_WINDOW_MS,
-    limit: config.RATE_AUTH_MAX,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    handler: (_req, res) =>
-      res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'Too many authentication attempts' } }),
-  });
+  const globalLimiter = limiter(config.RATE_GLOBAL_WINDOW_MS, config.RATE_GLOBAL_MAX, 'Too many requests');
+  const authLimiter = limiter(config.RATE_AUTH_WINDOW_MS, config.RATE_AUTH_MAX, 'Too many authentication attempts');
+  const tradeLimiter = limiter(
+    config.RATE_TRADE_WINDOW_MS,
+    config.RATE_TRADE_MAX,
+    'Too many trade requests',
+    (req) => req.auth?.userId ?? ipKeyGenerator(req.ip ?? ''),
+  );
 
-  const tradeLimiter = rateLimit({
-    windowMs: config.RATE_TRADE_WINDOW_MS,
-    limit: config.RATE_TRADE_MAX,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    keyGenerator: (req: Request) => req.auth?.userId ?? ipKeyGenerator(req.ip ?? ''),
-    handler: (_req, res) =>
-      res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'Too many trade requests, slow down' } }),
-  });
+  api.use(globalLimiter);
+  api.use(marketRoutes(ctx));
+  api.use('/auth', authLimiter, authRoutes(ctx, requireAuth));
+  api.use(accountRoutes(ctx, requireAuth));
+  api.use(tradeRoutes(ctx, requireAuth, tradeLimiter));
+  api.use('/admin', requireAdmin, adminRoutes(ctx, requireAdmin));
+  api.use(paymentRoutes(ctx));
 
-  const { requireAuth, requireAdmin } = createAuthMiddleware(ctx.tokens);
+  api.use((_req, _res, next) => next(AppError.notFound('Unknown API endpoint')));
 
-  app.use('/api/auth', authLimiter, authRoutes(ctx));
-  app.use('/api', globalLimiter, marketRoutes(ctx));
-  app.use('/api', globalLimiter, accountRoutes(ctx, requireAuth));
-  app.use('/api', globalLimiter, tradeRoutes(ctx, requireAuth, tradeLimiter));
-  app.use('/api/admin', globalLimiter, adminRoutes(ctx, requireAdmin));
+  app.use('/api/v1', api);
 
-  app.use('/api', (_req, _res, next) => next(AppError.notFound('Unknown API endpoint')));
-
-  // --- static demo client --------------------------------------------------
+  // ------------------------------------------------------------- static UI
   app.use(
     express.static(publicDir, {
       index: 'index.html',
+      extensions: ['html'],
       setHeaders: (res, filePath) => {
         if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
       },
     }),
   );
 
-  // --- errors --------------------------------------------------------------
+  // SPA routes
+  const appShell = (_req: Request, res: Response) => res.sendFile(path.join(publicDir, 'index.html'));
+  for (const route of ['/login', '/register', '/forgot-password', '/reset-password', '/verify-email', '/trading', '/account', '/admin']) {
+    app.get(route, appShell);
+  }
+
+  // --------------------------------------------------------------- errors
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof AppError) {
       if (err.status >= 500) logger.error({ err, url: req.url }, 'request failed');
@@ -182,7 +192,7 @@ export function createApp(ctx: AppContext): express.Express {
       });
       return;
     }
-    const e = err as { type?: string; status?: number; message?: string };
+    const e = err as { type?: string; status?: number };
     if (e?.type === 'entity.parse.failed') {
       res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Malformed JSON body' } });
       return;
