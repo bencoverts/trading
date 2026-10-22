@@ -1,148 +1,100 @@
 /**
- * WebSocket client with:
- *  - subscribe/unsubscribe per market+timeframe
- *  - coalesced tick rendering (requestAnimationFrame)
- *  - exponential backoff reconnect + sequence resume
- *  - app-level ping to detect half-open sockets
+ * WebSocket client with the v3 protocol:
+ *   subscribe/unsubscribe/resume, tick, candle, candle_closed, market_status,
+ *   trade:opened, trade:settled, balance, notification, hello, pong, error.
+ * Auto-reconnects with exponential backoff and resubscribes automatically.
  */
-export class MarketSocket {
-  constructor(handlers = {}) {
-    this.handlers = handlers;
-    this.ws = null;
-    this.subs = new Set();
-    this.seq = new Map();
-    this.attempt = 0;
-    this.closedByUser = false;
-    this.pingTimer = null;
-    this.lastMessage = 0;
-    this.reconnectTimer = null;
-    this.token = null;
-  }
 
-  connect() {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
-    this.closedByUser = false;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const query = this.token ? `?token=${encodeURIComponent(this.token)}` : '';
-    const ws = new WebSocket(`${proto}//${location.host}/ws${query}`);
-    this.ws = ws;
+export function createSocket({ onMessage, onStatus } = {}) {
+  let socket = null;
+  let attempts = 0;
+  let heartbeat = null;
+  let closedByUser = false;
+  const subscriptions = new Set(); // "SYMBOL|tf"
+  const lastSeq = new Map();
+  let lastPingSent = 0;
 
-    ws.addEventListener('open', () => {
-      this.attempt = 0;
-      this.lastMessage = Date.now();
-      this.handlers.onStatus?.('online');
-      for (const key of this.subs) {
-        const [market, timeframe] = key.split('|');
-        ws.send(JSON.stringify({ type: 'subscribe', market, timeframe }));
+  const url = () => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${location.host}/ws`;
+  };
+
+  function connect() {
+    onStatus?.('connecting');
+    socket = new WebSocket(url());
+
+    socket.addEventListener('open', () => {
+      attempts = 0;
+      onStatus?.('live');
+      for (const key of subscriptions) {
+        const [symbol, timeframe] = key.split('|');
+        socket.send(JSON.stringify({ type: 'subscribe', symbol, timeframe }));
       }
-      for (const [market, seq] of this.seq) {
-        if (seq > 0) ws.send(JSON.stringify({ type: 'resume', market, lastSeq: seq }));
-      }
-      this.startPing();
+      clearInterval(heartbeat);
+      heartbeat = setInterval(() => {
+        if (socket?.readyState !== WebSocket.OPEN) return;
+        lastPingSent = Date.now();
+        socket.send(JSON.stringify({ type: 'ping', id: lastPingSent }));
+      }, 25_000);
     });
 
-    ws.addEventListener('message', (event) => {
-      this.lastMessage = Date.now();
-      let msg;
+    socket.addEventListener('message', (event) => {
+      let message;
       try {
-        msg = JSON.parse(event.data);
+        message = JSON.parse(event.data);
       } catch {
         return;
       }
-      if ((msg.type === 'tick' || msg.type === 'candle' || msg.type === 'candle_closed') && msg.market) {
-        const seq = Number(msg.seq ?? 0);
-        if (seq > (this.seq.get(msg.market) ?? 0)) this.seq.set(msg.market, seq);
+      if (message.type === 'pong') {
+        const latency = lastPingSent ? Date.now() - lastPingSent : null;
+        if (latency !== null) onMessage?.({ type: 'latency', ms: latency });
+        return;
       }
-      this.handlers.onMessage?.(msg);
+      if (typeof message.seq === 'number' && message.symbol) lastSeq.set(message.symbol, message.seq);
+      onMessage?.(message);
     });
 
-    ws.addEventListener('close', () => {
-      this.stopPing();
-      this.ws = null;
-      this.handlers.onStatus?.('offline');
-      if (!this.closedByUser) this.scheduleReconnect();
+    socket.addEventListener('close', () => {
+      clearInterval(heartbeat);
+      onStatus?.('offline');
+      if (closedByUser) return;
+      attempts += 1;
+      const delay = Math.min(15_000, 600 * 2 ** Math.min(attempts, 5));
+      setTimeout(connect, delay);
     });
 
-    ws.addEventListener('error', () => {
-      try {
-        ws.close();
-      } catch {
-        /* ignore */
+    socket.addEventListener('error', () => onStatus?.('offline'));
+  }
+
+  connect();
+
+  return {
+    get connected() {
+      return socket?.readyState === WebSocket.OPEN;
+    },
+    subscribe(symbol, timeframe) {
+      const key = `${symbol}|${timeframe}`;
+      subscriptions.clear();
+      subscriptions.add(key);
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'subscribe', symbol, timeframe }));
       }
-    });
-  }
-
-  scheduleReconnect() {
-    if (this.reconnectTimer) return;
-    const delay = Math.min(15_000, 500 * 2 ** this.attempt);
-    this.attempt += 1;
-    this.handlers.onStatus?.('connecting');
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, delay);
-  }
-
-  startPing() {
-    this.stopPing();
-    this.pingTimer = setInterval(() => {
-      this.send({ type: 'ping', id: Date.now() });
-      if (Date.now() - this.lastMessage > 60_000) {
-        try {
-          this.ws?.close();
-        } catch {
-          /* ignore */
-        }
-      }
-    }, 25_000);
-  }
-
-  stopPing() {
-    if (this.pingTimer) clearInterval(this.pingTimer);
-    this.pingTimer = null;
-  }
-
-  send(message) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
-      return true;
-    }
-    return false;
-  }
-
-  subscribe(market, timeframe) {
-    this.subs.add(`${market}|${timeframe}`);
-    this.send({ type: 'subscribe', market, timeframe });
-  }
-
-  unsubscribe(market, timeframe) {
-    this.subs.delete(`${market}|${timeframe}`);
-    this.send({ type: 'unsubscribe', market, timeframe });
-  }
-
-  clearSubscriptions() {
-    for (const key of this.subs) {
-      const [market, timeframe] = key.split('|');
-      this.send({ type: 'unsubscribe', market, timeframe });
-    }
-    this.subs.clear();
-  }
-
-  authenticate(token) {
-    this.token = token;
-    if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: 'auth', token });
-  }
-
-  close() {
-    this.closedByUser = true;
-    this.stopPing();
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
-    try {
-      this.ws?.close();
-    } catch {
-      /* ignore */
-    }
-    this.ws = null;
-  }
+    },
+    unsubscribe() {
+      subscriptions.clear();
+    },
+    resume(symbol) {
+      const seq = lastSeq.get(symbol);
+      if (seq === undefined || socket?.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: 'resume', symbol, lastSeq: seq }));
+    },
+    auth(token) {
+      if (socket?.readyState === WebSocket.OPEN && token) socket.send(JSON.stringify({ type: 'auth', token }));
+    },
+    close() {
+      closedByUser = true;
+      clearInterval(heartbeat);
+      socket?.close();
+    },
+  };
 }
