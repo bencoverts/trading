@@ -94,8 +94,9 @@ exits 0 with no diagnostics.
 * Auth rate limiting returns `429` after the configured number of attempts.
 * Logout clears the cookie (`Max-Age=0`/expiry) and requires a session for the
   first call.
-* Helmet headers present (`CSP`, `nosniff`, no `x-powered-by`); CORS reflects
-  only allow-listed origins.
+* Helmet headers present (`CSP`, `nosniff`, no `x-powered-by`); CORS echoes only
+  allow-listed origins (the configured list, plus same-host requests so a
+  reverse proxy / preview domain works) and never an arbitrary origin.
 * Bearer tokens work as an alternative to the cookie; garbage tokens → `401`.
 * Admin: anonymous → `401` and normal user → `403` on every admin route; a JWT
   whose payload claims `role: admin` (invalid signature) → `401`, and a valid
@@ -148,6 +149,10 @@ exits 0 with no diagnostics.
 
 Recorded because an "all green" report is only meaningful with the history:
 
+0. Under a proxied host the WebSocket handshake and CORS rejected the
+   same-host origin (the check compared against the configured list only). Both
+   now also accept "origin host == request host"; the strict list is still
+   enforced for anything else.
 1. Candle paging returned the forming candle on the second page (fixed in
    `MarketDataService.candles`; asserted in `market-api.test.ts`).
 2. Tick buffering depended on `start()` being called, so short-lived runtimes

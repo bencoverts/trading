@@ -50,34 +50,43 @@ export function createApp(ctx: AppContext): express.Express {
     }),
   );
 
-  app.use(
+  /**
+   * Strict CORS: an origin is allowed when it is listed in CORS_ORIGINS or when
+   * its host equals the request host (same-origin behind a reverse proxy or a
+   * preview domain). Anything else gets no CORS headers at all - the origin is
+   * never reflected blindly.
+   */
+  const hostOf = (value: string): string | null => {
+    try {
+      return new URL(value).host;
+    } catch {
+      return null;
+    }
+  };
+  const allowedOrigins = new Set(config.CORS_ORIGINS.map(hostOf).filter((h): h is string => Boolean(h)));
+
+  app.use((req, res, next) => {
+    const requestOrigin = req.header('origin');
+    const allow = (origin: string) => {
+      const host = hostOf(origin);
+      return (
+        config.CORS_ORIGINS.includes('*') ||
+        config.CORS_ORIGINS.includes(origin) ||
+        (host !== null && (allowedOrigins.has(host) || host === req.headers.host))
+      );
+    };
     cors({
-      origin(origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
-        if (!origin) return callback(null, true);
-        if (config.CORS_ORIGINS.includes('*') || config.CORS_ORIGINS.includes(origin)) return callback(null, true);
-        try {
-          const host = new URL(origin).host;
-          if (config.CORS_ORIGINS.some((o) => {
-            try {
-              return new URL(o).host === host;
-            } catch {
-              return false;
-            }
-          })) {
-            return callback(null, true);
-          }
-        } catch {
-          /* fall through */
-        }
-        return callback(null, false);
+      origin: (_origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+        if (!requestOrigin) return callback(null, true);
+        return callback(null, allow(requestOrigin));
       },
       credentials: true,
       methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
       exposedHeaders: ['Idempotency-Key', 'Idempotent-Replayed'],
       maxAge: 600,
-    }),
-  );
+    })(req, res, next);
+  });
 
   app.use(cookieParser());
   app.use(
