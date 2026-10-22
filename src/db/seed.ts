@@ -204,7 +204,7 @@ export async function seedDatabase(
     username: string;
     password: string;
     displayName: string;
-    staffRole: 'super_admin' | 'operator' | 'support' | 'viewer' | null;
+    staffRole: 'super_admin' | 'operator' | 'finance' | 'support' | 'viewer' | null;
     verified: boolean;
   }): Promise<string | null> => {
     const email = input.email.trim().toLowerCase();
@@ -295,7 +295,7 @@ export async function seedDatabase(
     const supportId = await ensureUser({
       email: 'support@simtrade.local',
       username: 'support',
-      password: 'support-password-123',
+      password: 'support-demo-123',
       displayName: 'Support Staff',
       staffRole: 'support',
       verified: true,
@@ -304,12 +304,21 @@ export async function seedDatabase(
     const operatorId = await ensureUser({
       email: 'operator@simtrade.local',
       username: 'operator',
-      password: 'operator-password-123',
+      password: 'operator-demo-123',
       displayName: 'Market Operator',
       staffRole: 'operator',
       verified: true,
     });
     if (operatorId) result.demoStaff += 1;
+    const financeId = await ensureUser({
+      email: 'finance@simtrade.local',
+      username: 'finance',
+      password: 'finance-demo-123',
+      displayName: 'Finance Staff',
+      staffRole: 'finance',
+      verified: true,
+    });
+    if (financeId) result.demoStaff += 1;
 
     result.demoTrades = seedDemoTrades(db, now, ledger);
   }

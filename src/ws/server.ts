@@ -134,6 +134,11 @@ export class RealtimeServer {
     for (const client of this.clients) this.send(client, message);
   }
 
+  /** Staff-only channel for new chat messages and finance alerts. */
+  sendToStaff(message: ServerMessage): void {
+    for (const client of this.clients) if (client.role === 'admin') this.send(client, message);
+  }
+
   sendToUser(userId: string, message: ServerMessage): void {
     const set = this.byUser.get(userId);
     if (!set) return;

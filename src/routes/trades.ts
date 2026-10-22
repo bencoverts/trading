@@ -72,6 +72,8 @@ export function tradeRoutes(ctx: AppContext, requireAuth: RequestHandler, tradeL
       }
       const amountMinor = toMinor(body.amount, body.currency);
       const market = body.market.toUpperCase();
+      // trading is only allowed on currencies an admin has enabled for trading
+      ctx.currencies.requireEnabled(body.currency, 'trading');
 
       // Idempotency-Key is mandatory: a retried POST can never open two trades.
       const rawKey = req.header('idempotency-key');

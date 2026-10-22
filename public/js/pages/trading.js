@@ -542,11 +542,13 @@ export async function tradingPage(ctx) {
         ),
       );
 
+      // market limits are configured in USD; convert with the *server* rate
+      const rates = state.config?.rates ?? { USD: 1, IDR: 16_000, USDT: 1 };
+      const factor = (rates[state.displayCurrency] ?? 1) / (rates.USD ?? 1);
       const min = m.minAmount ?? 1;
       const maxUsd = m.maxAmount ?? 1_000;
-      const limit =
-        state.displayCurrency === 'USD' ? maxUsd : state.displayCurrency === 'IDR' ? maxUsd * 16_000 : maxUsd;
-      const minLimit = state.displayCurrency === 'USD' ? min : state.displayCurrency === 'IDR' ? min * 16_000 : min;
+      const limit = maxUsd * factor;
+      const minLimit = min * factor;
       const outOfRange = amount > 0 && (amount < minLimit || amount > limit);
       const notEnough = amount > (wallet.balance ?? 0);
       warning.classList.toggle('hidden', !(outOfRange || notEnough));

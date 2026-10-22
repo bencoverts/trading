@@ -4,7 +4,6 @@ import type { AppContext } from '../app/context.js';
 import { asyncHandler, parseInput } from '../http/validation.js';
 import { AppError } from '../lib/errors.js';
 import {
-  CURRENCIES,
   CURRENCY_LIST,
   DURATION_PRESETS,
   MAX_DURATION_SEC,
@@ -228,17 +227,22 @@ export function marketRoutes(ctx: AppContext): Router {
           topupCooldownSec: settings.topupCooldownSec,
           resetCooldownSec: settings.resetCooldownSec,
         },
-        currencies: CURRENCY_LIST.map((code) => CURRENCIES[code]),
+        currencies: ctx.currencies.list({ includeInactive: true }),
+        activeCurrencies: ctx.currencies.list(),
         rates: settings.rates,
+        site: ctx.site.publicConfig(),
+        payments: ctx.payments.describe(),
         timeframes: TIMEFRAME_LIST,
         moods: MOODS,
         trends: TRENDS,
         volatilityPresets: VOLATILITY_PRESETS,
         features: {
-          deposits: false,
-          withdrawals: false,
-          payments: false,
-          registration: true,
+          deposits: ctx.site.isEnabled('deposits'),
+          withdrawals: ctx.site.isEnabled('withdrawals'),
+          payments: ctx.payments.describe().configured,
+          demoTopup: ctx.site.isEnabled('demo_topup'),
+          registration: ctx.site.isEnabled('registrations'),
+          liveChat: ctx.site.isEnabled('live_chat'),
           twoFactor: true,
         },
       });

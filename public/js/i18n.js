@@ -9,6 +9,9 @@ const id = {
   'footer.disclaimer':
     'Platform simulasi untuk edukasi. Tidak ada uang sungguhan, tidak ada deposit/penarikan, dan bukan layanan investasi.',
   'nav.home': 'Beranda',
+  'nav.platform': 'Platform',
+  'nav.deposit': 'Deposit',
+  'nav.chat': 'Live Chat',
   'nav.trade': 'Trading',
   'nav.history': 'Riwayat',
   'nav.account': 'Akun',
@@ -91,6 +94,9 @@ const en = {
   'footer.disclaimer':
     'Simulation platform for education. No real money, no deposits or withdrawals, and not an investment service.',
   'nav.home': 'Home',
+  'nav.platform': 'Platform',
+  'nav.deposit': 'Deposit',
+  'nav.chat': 'Live chat',
   'nav.trade': 'Trading',
   'nav.history': 'History',
   'nav.account': 'Account',

@@ -2,7 +2,7 @@
  * Staff roles and the permission matrix used by the admin API and the admin UI.
  * Roles live on `users.staff_role`; product users have none.
  */
-export const STAFF_ROLES = ['super_admin', 'operator', 'support', 'viewer'] as const;
+export const STAFF_ROLES = ['super_admin', 'operator', 'finance', 'support', 'viewer'] as const;
 export type StaffRole = (typeof STAFF_ROLES)[number];
 
 export const PERMISSIONS = [
@@ -27,6 +27,16 @@ export const PERMISSIONS = [
   'system.write',
   'audit.read',
   'payments.read',
+  'payments.write',
+  'deposits.read',
+  'deposits.review',
+  'withdrawals.read',
+  'withdrawals.process',
+  'currencies.write',
+  'chat.read',
+  'chat.write',
+  'site.write',
+  'flags.write',
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -48,6 +58,25 @@ export const ROLE_PERMISSIONS: Record<StaffRole, Permission[]> = {
     'settings.read',
     'finance.read',
     'payments.read',
+    'chat.read',
+    'chat.write',
+  ],
+  finance: [
+    'dashboard.read',
+    'finance.read',
+    'finance.write',
+    'payments.read',
+    'payments.write',
+    'currencies.write',
+    'deposits.read',
+    'deposits.review',
+    'withdrawals.read',
+    'withdrawals.process',
+    'users.read',
+    'audit.read',
+    'settings.read',
+    'content.read',
+    'chat.read',
   ],
   support: [
     'dashboard.read',
@@ -62,6 +91,10 @@ export const ROLE_PERMISSIONS: Record<StaffRole, Permission[]> = {
     'content.read',
     'audit.read',
     'payments.read',
+    'deposits.read',
+    'withdrawals.read',
+    'chat.read',
+    'chat.write',
   ],
   viewer: [
     'dashboard.read',
@@ -73,6 +106,9 @@ export const ROLE_PERMISSIONS: Record<StaffRole, Permission[]> = {
     'content.read',
     'audit.read',
     'payments.read',
+    'deposits.read',
+    'withdrawals.read',
+    'chat.read',
     'system.read',
   ],
 };

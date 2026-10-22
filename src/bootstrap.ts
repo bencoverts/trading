@@ -24,6 +24,12 @@ import { UploadService } from './services/uploads.js';
 import { StatsService } from './services/stats.js';
 import { DevMailer, MemoryMailer, type Mailer } from './services/mailer.js';
 import { PaymentService } from './payments/service.js';
+import { KlikQrisClient } from './payments/klikqris.js';
+import { CurrencyService } from './services/currencies.js';
+import { DepositService } from './services/deposits.js';
+import { WithdrawalService } from './services/withdrawals.js';
+import { ChatService } from './services/chat.js';
+import { SiteService } from './services/site.js';
 import { createApp } from './http/app.js';
 import type { AppContext } from './app/context.js';
 import { RealtimeServer } from './ws/server.js';
@@ -44,6 +50,8 @@ export interface RuntimeOptions {
   demoData?: boolean;
   backfill?: boolean;
   mailer?: Mailer;
+  /** injectable KlikQRIS transport (tests never touch the network) */
+  paymentTransport?: import('./payments/klikqris.js').KlikQrisTransport;
   listen?: boolean;
   port?: number;
   host?: string;
@@ -113,6 +121,21 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   });
   const ledger = new LedgerService(db);
   const wallets = new WalletService({ db, settings, ledger, now: () => clock.now() });
+  const currencies = new CurrencyService(db, () => clock.now());
+  const site = new SiteService(db, () => clock.now());
+  const kliqris = new KlikQrisClient(
+    {
+      baseUrl: config.KLIKQRIS_BASE_URL,
+      apiKey: config.KLIKQRIS_API_KEY,
+      merchantId: config.KLIKQRIS_MERCHANT_ID,
+      callbackUrl: config.KLIKQRIS_CALLBACK_URL,
+      webhookSecret: config.KLIKQRIS_WEBHOOK_SECRET,
+      signatureHeader: config.KLIKQRIS_SIGNATURE_HEADER,
+      timeoutMs: config.KLIKQRIS_TIMEOUT_MS,
+      logger,
+    },
+    options.paymentTransport,
+  );
   const trades = new TradeService({ db, engine, settings, wallets, markets, clock, logger });
   const marketData = new MarketDataService({ db, engine, logger, config, clock });
   const settlement = new SettlementLoop({
@@ -123,6 +146,28 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     firstDelayMs: 1_000,
   });
   const notifications = new NotificationService(db, () => clock.now());
+  let realtime: RealtimeServer | null = null;
+  const pushToUser = (userId: string, message: Record<string, unknown>) =>
+    realtime?.sendToUser(userId, message as never);
+  const pushToStaff = (message: Record<string, unknown>) => realtime?.sendToStaff(message as never);
+  const deposits = new DepositService({
+    db,
+    currencies,
+    wallets,
+    notifications,
+    client: kliqris,
+    now: () => clock.now(),
+    push: pushToUser,
+  });
+  const withdrawals = new WithdrawalService({
+    db,
+    currencies,
+    wallets,
+    notifications,
+    now: () => clock.now(),
+    push: pushToUser,
+  });
+  const chat = new ChatService({ db, notifications, now: () => clock.now(), push: pushToUser, pushStaff: pushToStaff });
   const content = new ContentService(db, () => clock.now());
   const uploads = new UploadService(config.UPLOADS_DIR, config.MAX_UPLOAD_BYTES, logger);
   const stats = new StatsService(db, () => clock.now());
@@ -177,7 +222,15 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     backups,
     tokens,
     mailer,
-    payments: new PaymentService(),
+    payments: new PaymentService(kliqris, {
+      depositsEnabled: config.PAYMENTS_ENABLED && site.isEnabled('deposits'),
+      withdrawalsEnabled: config.PAYMENTS_ENABLED && site.isEnabled('withdrawals'),
+    }),
+    currencies,
+    deposits,
+    withdrawals,
+    chat,
+    site,
     realtime: null,
   };
   markets.setHistoryBootstrap((symbol) => {
@@ -193,7 +246,6 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const app = createApp(ctx);
   const server = http.createServer(app);
 
-  let realtime: RealtimeServer | null = null;
   if (options.attachRealtime !== false) {
     realtime = new RealtimeServer({ server, config, logger, engine, tokens, users, accounts, markets });
     ctx.realtime = realtime;

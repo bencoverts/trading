@@ -22,11 +22,16 @@ const SECTIONS = [
   ['trades', 'Trade', 'trades.read'],
   ['users', 'Pengguna', 'users.read'],
   ['finance', 'Keuangan demo', 'finance.read'],
+  ['deposits', 'Deposit', 'deposits.read'],
+  ['withdrawals', 'Penarikan', 'withdrawals.read'],
+  ['currencies', 'Mata uang', 'finance.read'],
+  ['chat', 'Live chat', 'chat.read'],
   ['settings', 'Pengaturan', 'settings.read'],
   ['content', 'Konten', 'content.read'],
   ['system', 'Sistem', 'system.read'],
   ['permissions', 'Peran & izin', 'dashboard.read'],
   ['payments', 'Pembayaran', 'payments.read'],
+  ['site', 'Situs & flag', 'settings.read'],
 ];
 
 const can = (permission) => state.permissions?.includes(permission);
@@ -54,6 +59,11 @@ export async function adminPage(ctx, { section } = {}) {
     trades: renderTrades,
     users: renderUsers,
     finance: renderFinance,
+    deposits: renderDeposits,
+    withdrawals: renderWithdrawals,
+    currencies: renderCurrencies,
+    chat: renderChatInbox,
+    site: renderSite,
     settings: renderSettings,
     content: renderContent,
     system: renderSystem,
@@ -1845,34 +1855,786 @@ async function renderAudit() {
 
 // ------------------------------------------------------------------- payments
 async function renderPayments(panel) {
-  panel.append(head('Pembayaran', 'Modul ini sengaja tidak diimplementasikan pada platform demo.'));
+  panel.append(head('Pembayaran', 'Status integrasi KlikQRIS, rekonsiliasi dan callback.'));
   const data = await get('/api/v1/admin/payments');
+  const provider = data.provider ?? {};
+  const statusRow = (label, value, tone = 'muted') =>
+    el('li', {}, el('span', {}, label), el('span', { class: `pill pill--${tone}` }, value));
+
+  const testButton = el(
+    'button',
+    {
+      class: 'btn btn--primary btn--sm',
+      type: 'button',
+      onClick: async () => {
+        testButton.disabled = true;
+        try {
+          const result = await post('/api/v1/admin/payments/test-connection', {});
+          toast({
+            title: result.ok ? 'Koneksi OK' : 'Koneksi gagal',
+            message: result.message ?? (result.ok ? 'Kredensial diterima provider.' : 'Periksa kredensial di env.'),
+            type: result.ok ? 'win' : 'error',
+          });
+        } catch (error) {
+          toast({ title: 'Koneksi gagal', message: error.message, type: 'error' });
+        } finally {
+          testButton.disabled = false;
+        }
+      },
+    },
+    'Tes koneksi',
+  );
+
+  const reconcileButton = el(
+    'button',
+    {
+      class: 'btn btn--ghost btn--sm',
+      type: 'button',
+      onClick: async () => {
+        reconcileButton.disabled = true;
+        try {
+          const result = await post('/api/v1/admin/payments/reconcile', {});
+          toast({
+            title: 'Rekonsiliasi selesai',
+            message: `${result.checked ?? 0} transaksi diperiksa · ${result.providerOnly ?? 0} hanya ada di provider.`,
+            type: 'info',
+          });
+        } catch (error) {
+          toast({ title: 'Rekonsiliasi gagal', message: error.message, type: 'error' });
+        } finally {
+          reconcileButton.disabled = false;
+        }
+      },
+    },
+    'Rekonsiliasi',
+  );
+
   panel.append(
     el(
-      'section',
-      { class: 'card' },
-      el('div', { class: 'alert alert--warn' }, el('strong', {}, 'SEGERA HADIR. '), data.message),
+      'div',
+      { class: 'grid grid--2' },
       el(
-        'p',
-        { class: 'muted' },
-        'Tidak ada QRIS, transfer bank, kartu, atau penarikan dana. Tidak ada integrasi pihak ketiga dan tidak ada data pembayaran yang boleh ditambahkan ke build ini.',
+        'section',
+        { class: 'card' },
+        el('h2', { class: 'card__title' }, 'KlikQRIS'),
+        el(
+          'ul',
+          { class: 'list-plain' },
+          statusRow('Mode', provider.mode === 'live' ? 'live' : 'sandbox / demo', 'warn'),
+          statusRow('API key', provider.apiKeySet ? 'terpasang' : 'belum', provider.apiKeySet ? 'up' : 'muted'),
+          statusRow('Merchant', provider.merchantIdMasked ?? '—'),
+          statusRow(
+            'Webhook secret',
+            provider.webhookSecretSet ? 'terpasang' : 'belum',
+            provider.webhookSecretSet ? 'up' : 'muted',
+          ),
+          statusRow('Uang nyata', provider.liveMoney ? 'ya' : 'tidak (demo)', 'warn'),
+          statusRow('Signature header', data.webhook?.signatureHeader ?? '—'),
+          statusRow('Endpoint callback', data.webhook?.path ?? '/api/webhooks/klikqris'),
+        ),
+        el('div', { class: 'chip-row', style: { marginTop: '10px' } }, testButton, reconcileButton),
+        el(
+          'p',
+          { class: 'muted', style: { fontSize: '11.5px' } },
+          'Kredensial hanya dibaca dari environment server. Callback wajib bertanda tangan HMAC; tanpa secret, semua callback ditolak (fail closed).',
+        ),
       ),
-      el('h2', { class: 'card__title' }, 'Status provider'),
+      el(
+        'section',
+        { class: 'card' },
+        el('h2', { class: 'card__title' }, 'Ringkasan transaksi'),
+        el(
+          'ul',
+          { class: 'list-plain' },
+          statusRow('Deposit menunggu', String(data.stats?.deposits?.pending ?? 0)),
+          statusRow('Deposit dibayar', String(data.stats?.deposits?.paid ?? 0), 'up'),
+          statusRow('Deposit review', String(data.stats?.deposits?.review ?? 0), 'warn'),
+          statusRow('Penarikan menunggu', String(data.stats?.withdrawals?.pending ?? 0)),
+          statusRow('Penarikan selesai', String(data.stats?.withdrawals?.completed ?? 0), 'up'),
+          statusRow('Callback diterima', String(data.stats?.callbacks ?? 0)),
+          statusRow('Callback ditolak', String(data.stats?.rejectedCallbacks ?? 0), 'warn'),
+        ),
+      ),
+    ),
+    el(
+      'section',
+      { class: 'card', style: { marginTop: '12px' } },
+      el('h2', { class: 'card__title' }, 'Callback terakhir'),
+      (() => {
+        const callbacks = (data.callbacks ?? []).slice(0, 20);
+        if (!callbacks.length)
+          return emptyState('Belum ada callback', 'Provider akan memanggil endpoint ini setelah pembayaran.');
+        return table(
+          [['Waktu'], ['Order'], ['Status'], ['Diterima'], ['Alasan']],
+          callbacks.map((row) => [
+            dateTime(row.createdAt ?? row.receivedAt),
+            row.orderId ?? row.order_id ?? '—',
+            row.status ?? '—',
+            row.accepted
+              ? el('span', { class: 'pill pill--up' }, 'ya')
+              : el('span', { class: 'pill pill--warn' }, 'tidak'),
+            row.reason ?? '—',
+          ]),
+        );
+      })(),
+    ),
+  );
+}
+
+// ------------------------------------------------------------------- deposits
+async function renderDeposits(panel) {
+  panel.append(head('Deposit', 'Verifikasi deposit manual dan pantau transaksi QRIS.'));
+  let status = 'all';
+  const tableBox = el('div', {});
+  const chips = el('div', { class: 'chip-row' });
+  for (const option of ['all', 'review', 'pending', 'paid', 'rejected', 'expired']) {
+    chips.append(
+      el(
+        'button',
+        {
+          type: 'button',
+          class: 'chip',
+          'aria-pressed': String(status === option),
+          onClick: (event) => {
+            status = option;
+            [...event.currentTarget.parentElement.children].forEach((chip) =>
+              chip.setAttribute('aria-pressed', String(chip === event.currentTarget)),
+            );
+            void load();
+          },
+        },
+        option === 'all' ? 'Semua' : option,
+      ),
+    );
+  }
+
+  const review = (deposit, action) => {
+    const reason = el('textarea', { class: 'input', rows: '3', placeholder: 'Alasan (wajib untuk menolak)' });
+    const dialog = modal({
+      title: `${action === 'approve' ? 'Setujui' : 'Tolak'} deposit ${deposit.id}`,
+      body: el(
+        'div',
+        {},
+        el('p', {}, `${deposit.currency} ${fmt(deposit.amount, 0)} · ${deposit.reference ?? deposit.orderId ?? '-'}`),
+        action === 'reject'
+          ? el('label', { class: 'field' }, el('span', {}, 'Alasan penolakan'), reason)
+          : el('p', { class: 'muted' }, 'Saldo demo akan dikreditkan setelah disetujui.'),
+      ),
+      actions: [
+        { label: 'Batal', className: 'btn--ghost' },
+        {
+          label: action === 'approve' ? 'Setujui' : 'Tolak',
+          className: action === 'approve' ? 'btn--primary' : 'btn--danger',
+          onClick: async () => {
+            try {
+              await post(`/api/v1/admin/deposits/${deposit.id}/review`, {
+                action,
+                ...(action === 'reject' ? { reason: reason.value.trim() } : {}),
+              });
+              toast({ title: 'Deposit diperbarui', type: 'win' });
+              await load();
+              return true;
+            } catch (error) {
+              toast({ title: 'Gagal', message: error.message, type: 'error' });
+              return false;
+            }
+          },
+        },
+      ],
+    });
+    void dialog;
+  };
+
+  const load = async () => {
+    clear(tableBox);
+    const data = await get(`/api/v1/admin/deposits?status=${status}&limit=100`).catch((error) => {
+      tableBox.append(el('div', { class: 'alert alert--error' }, error.message));
+      return null;
+    });
+    if (!data) return;
+    if (!data.items?.length) {
+      tableBox.append(emptyState('Tidak ada deposit', 'Deposit baru akan muncul di sini.'));
+      return;
+    }
+    tableBox.append(
       table(
-        [['Provider'], ['Status'], ['Catatan']],
-        (data.providers ?? []).map((provider) => [
-          provider.id ?? provider.name ?? '—',
-          el('span', { class: 'pill pill--muted' }, 'tidak tersedia'),
-          provider.note ?? 'placeholder',
+        [['Dibuat'], ['User'], ['Metode'], ['Nominal'], ['Status'], ['Aksi']],
+        data.items.map((row) => [
+          dateTime(row.createdAt),
+          row.userEmail ?? row.userId ?? '—',
+          row.method === 'manual' ? 'manual' : 'QRIS',
+          money(row.totalAmount ?? row.amount, row.currency),
+          statusPill(row.status),
+          row.status === 'review'
+            ? el(
+                'div',
+                { class: 'chip-row' },
+                el(
+                  'button',
+                  { class: 'btn btn--primary btn--sm', type: 'button', onClick: () => review(row, 'approve') },
+                  'Setujui',
+                ),
+                el(
+                  'button',
+                  { class: 'btn btn--danger btn--sm', type: 'button', onClick: () => review(row, 'reject') },
+                  'Tolak',
+                ),
+              )
+            : el('span', { class: 'muted small' }, row.orderId ?? '—'),
         ]),
       ),
-      el('h2', { class: 'card__title', style: { marginTop: '12px' } }, 'Rencana fase berikutnya'),
+    );
+  };
+
+  panel.append(chips, tableBox);
+  await load();
+}
+
+// ---------------------------------------------------------------- withdrawals
+async function renderWithdrawals(panel) {
+  panel.append(
+    head('Penarikan', 'Setujui, proses, dan selesaikan penarikan demo. Dana ditahan sampai selesai.'),
+    el(
+      'div',
+      { class: 'alert alert--warn' },
+      el('strong', {}, 'Manual. '),
+      'Tidak ada transfer otomatis; setiap aksi dicatat di audit log.',
+    ),
+  );
+
+  let status = 'pending';
+  const tableBox = el('div', {});
+  const chips = el('div', { class: 'chip-row' });
+  for (const option of ['pending', 'review', 'approved', 'processing', 'completed', 'rejected', 'all']) {
+    chips.append(
       el(
-        'ul',
-        { class: 'list-plain' },
-        el('li', {}, 'Integrasi penyedia pembayaran (di luar cakupan demo)'),
-        el('li', {}, 'Kebijakan KYC/AML dan kepatuhan'),
-        el('li', {}, 'Rekonsiliasi ledger dengan penyedia'),
+        'button',
+        {
+          type: 'button',
+          class: 'chip',
+          'aria-pressed': String(status === option),
+          onClick: (event) => {
+            status = option;
+            [...event.currentTarget.parentElement.children].forEach((chip) =>
+              chip.setAttribute('aria-pressed', String(chip === event.currentTarget)),
+            );
+            void load();
+          },
+        },
+        option === 'all' ? 'Semua' : option,
+      ),
+    );
+  }
+
+  const act = (row, action) => {
+    const reason = el('textarea', { class: 'input', rows: '2', placeholder: 'Alasan (wajib untuk menolak)' });
+    const transferRef = el('input', { class: 'input', placeholder: 'Referensi transfer bank' });
+    const dialog = modal({
+      title: `${action} · ${row.id}`,
+      body: el(
+        'div',
+        {},
+        el('p', {}, `${money(row.amount, row.currency)} → ${row.destinationMasked}`),
+        action === 'complete'
+          ? el('label', { class: 'field' }, el('span', {}, 'Referensi transfer'), transferRef)
+          : null,
+        action === 'reject' ? el('label', { class: 'field' }, el('span', {}, 'Alasan'), reason) : null,
+      ),
+      actions: [
+        { label: 'Batal', className: 'btn--ghost' },
+        {
+          label: 'Konfirmasi',
+          className: action === 'reject' ? 'btn--danger' : 'btn--primary',
+          onClick: async () => {
+            try {
+              await post(`/api/v1/admin/withdrawals/${row.id}/transition`, {
+                action,
+                ...(action === 'complete' ? { transferRef: transferRef.value.trim() } : {}),
+                ...(action === 'reject' ? { reason: reason.value.trim() } : {}),
+              });
+              toast({ title: 'Status diperbarui', type: 'win' });
+              await load();
+              return true;
+            } catch (error) {
+              toast({ title: 'Gagal', message: error.message, type: 'error' });
+              return false;
+            }
+          },
+        },
+      ],
+    });
+    void dialog;
+  };
+
+  const nextAction = (statusValue) => {
+    if (statusValue === 'pending') return 'approve';
+    if (statusValue === 'review') return 'approve';
+    if (statusValue === 'approved') return 'process';
+    if (statusValue === 'processing') return 'complete';
+    return null;
+  };
+
+  const load = async () => {
+    clear(tableBox);
+    const data = await get(`/api/v1/admin/withdrawals?status=${status}&limit=100`).catch((error) => {
+      tableBox.append(el('div', { class: 'alert alert--error' }, error.message));
+      return null;
+    });
+    if (!data) return;
+    if (!data.items?.length) {
+      tableBox.append(emptyState('Tidak ada penarikan', 'Pengajuan pengguna akan muncul di sini.'));
+      return;
+    }
+    tableBox.append(
+      table(
+        [['Dibuat'], ['User'], ['Nominal'], ['Tujuan'], ['Status'], ['Aksi']],
+        data.items.map((row) => {
+          const action = nextAction(row.status);
+          return [
+            dateTime(row.createdAt),
+            row.userEmail ?? row.userId ?? '—',
+            `${money(row.amount, row.currency)} (net ${money(row.net, row.currency)})`,
+            row.destinationMasked,
+            statusPill(row.status),
+            el(
+              'div',
+              { class: 'chip-row' },
+              action
+                ? el(
+                    'button',
+                    { class: 'btn btn--primary btn--sm', type: 'button', onClick: () => act(row, action) },
+                    action,
+                  )
+                : null,
+              ['pending', 'review', 'approved', 'processing'].includes(row.status)
+                ? el(
+                    'button',
+                    { class: 'btn btn--danger btn--sm', type: 'button', onClick: () => act(row, 'reject') },
+                    'reject',
+                  )
+                : null,
+              row.transferRef ? el('span', { class: 'small mono' }, row.transferRef) : null,
+            ),
+          ];
+        }),
+      ),
+    );
+  };
+
+  panel.append(chips, tableBox);
+  await load();
+}
+
+// ------------------------------------------------------------------ currencies
+async function renderCurrencies(panel) {
+  panel.append(
+    head('Mata uang', 'Aktifkan mata uang dan atur limit, biaya serta kurs demo.'),
+    el(
+      'div',
+      { class: 'alert alert--warn' },
+      el('strong', {}, 'Hati-hati. '),
+      'Menonaktifkan mata uang tidak menghapus saldo. Perubahan limit dan kurs dicatat di audit log.',
+    ),
+  );
+
+  const data = await get('/api/v1/admin/currencies');
+  const box = el('div', {});
+  const render = () => {
+    clear(box);
+    box.append(
+      table(
+        [
+          ['Kode'],
+          ['Nama'],
+          ['Aktif'],
+          ['Deposit'],
+          ['Tarik'],
+          ['Trading'],
+          ['Limit deposit'],
+          ['Limit tarik'],
+          ['Biaya'],
+          ['Kurs IDR'],
+          ['Aksi'],
+        ],
+        data.currencies.map((currency) => [
+          el('span', { class: 'mono' }, currency.code),
+          currency.name,
+          currency.active
+            ? el('span', { class: 'pill pill--up' }, 'ya')
+            : el('span', { class: 'pill pill--muted' }, 'tidak'),
+          currency.depositEnabled ? 'ya' : '—',
+          currency.withdrawalEnabled ? 'ya' : '—',
+          currency.tradingEnabled ? 'ya' : '—',
+          `${money(currency.minDeposit ?? 0, currency.code)} – ${money(currency.maxDeposit ?? 0, currency.code)}`,
+          `${money(currency.minWithdrawal ?? 0, currency.code)} – ${money(currency.maxWithdrawal ?? 0, currency.code)}`,
+          `${money(currency.withdrawalFee, currency.code)} + ${currency.withdrawalFeeBps / 100}%`,
+          currency.fxRateToIdr ? fmt(currency.fxRateToIdr, 2) : '—',
+          el(
+            'button',
+            {
+              class: 'btn btn--ghost btn--sm',
+              type: 'button',
+              onClick: () => edit(currency),
+            },
+            'Ubah',
+          ),
+        ]),
+      ),
+    );
+  };
+
+  const edit = (currency) => {
+    const field = (label, input) => el('label', { class: 'field' }, el('span', {}, label), input);
+    const toggle = (label, key) => {
+      const input = el('input', { type: 'checkbox', checked: currency[key] });
+      return el('label', { class: 'checkbox' }, input, el('span', {}, label));
+    };
+    const active = el('input', { type: 'checkbox', checked: currency.active });
+    const deposit = el('input', { type: 'checkbox', checked: currency.depositEnabled });
+    const withdrawal = el('input', { type: 'checkbox', checked: currency.withdrawalEnabled });
+    const trading = el('input', { type: 'checkbox', checked: currency.tradingEnabled });
+    const minDeposit = el('input', { class: 'input', type: 'number', value: String(currency.minDeposit ?? 0) });
+    const maxDeposit = el('input', { class: 'input', type: 'number', value: String(currency.maxDeposit ?? 0) });
+    const minWithdrawal = el('input', { class: 'input', type: 'number', value: String(currency.minWithdrawal ?? 0) });
+    const maxWithdrawal = el('input', { class: 'input', type: 'number', value: String(currency.maxWithdrawal ?? 0) });
+    const fee = el('input', { class: 'input', type: 'number', value: String(currency.withdrawalFee) });
+    const feeBps = el('input', { class: 'input', type: 'number', value: String(currency.withdrawalFeeBps) });
+    const rate = el('input', {
+      class: 'input',
+      type: 'number',
+      step: '0.0001',
+      value: String(currency.fxRateToIdr ?? ''),
+    });
+    const source = el('input', { class: 'input', value: currency.fxSource ?? '' });
+
+    modal({
+      title: `Ubah ${currency.code}`,
+      body: el(
+        'div',
+        {},
+        el(
+          'div',
+          { class: 'chip-row' },
+          el('label', { class: 'checkbox' }, active, el('span', {}, 'Aktif')),
+          toggle('Deposit', 'depositEnabled'),
+          el('label', { class: 'checkbox' }, withdrawal, el('span', {}, 'Tarik')),
+          el('label', { class: 'checkbox' }, trading, el('span', {}, 'Trading')),
+        ),
+        el('div', { class: 'form-row' }, field('Min deposit', minDeposit), field('Maks deposit', maxDeposit)),
+        el('div', { class: 'form-row' }, field('Min tarik', minWithdrawal), field('Maks tarik', maxWithdrawal)),
+        el('div', { class: 'form-row' }, field('Biaya flat', fee), field('Biaya (bps)', feeBps)),
+        el('div', { class: 'form-row' }, field('Kurs ke IDR', rate), field('Sumber kurs', source)),
+        el(
+          'p',
+          { class: 'small muted' },
+          'Kurs demo tidak boleh dianggap kurs nyata. Sumber wajib diisi agar nilai tukar dapat diaudit.',
+        ),
+      ),
+      actions: [
+        { label: 'Batal', className: 'btn--ghost' },
+        {
+          label: 'Simpan',
+          className: 'btn--primary',
+          onClick: async () => {
+            try {
+              await patch(`/api/v1/admin/currencies/${currency.code}`, {
+                active: active.checked,
+                depositEnabled: deposit.checked,
+                withdrawalEnabled: withdrawal.checked,
+                tradingEnabled: trading.checked,
+                minDeposit: Number(minDeposit.value) || null,
+                maxDeposit: Number(maxDeposit.value) || null,
+                minWithdrawal: Number(minWithdrawal.value) || null,
+                maxWithdrawal: Number(maxWithdrawal.value) || null,
+                withdrawalFee: Number(fee.value),
+                withdrawalFeeBps: Number(feeBps.value),
+                fxRateToIdr: Number(rate.value) || null,
+                fxSource: source.value.trim() || null,
+              });
+              toast({ title: 'Mata uang diperbarui', type: 'win' });
+              const fresh = await get('/api/v1/admin/currencies');
+              data.currencies = fresh.currencies;
+              render();
+              return true;
+            } catch (error) {
+              toast({ title: 'Gagal', message: error.message, type: 'error' });
+              return false;
+            }
+          },
+        },
+      ],
+    });
+  };
+
+  render();
+  panel.append(box);
+}
+
+// -------------------------------------------------------------- live chat inbox
+async function renderChatInbox(panel) {
+  panel.append(
+    head('Live chat', 'Balas pengguna atau tinggalkan catatan internal.'),
+    el(
+      'div',
+      { class: 'alert alert--warn' },
+      el('strong', {}, 'SIMULASI. '),
+      'Percakapan disimpan lokal; tidak ada layanan chat pihak ketiga.',
+    ),
+  );
+
+  const listBox = el('div', { class: 'chat-list' });
+  const threadBox = el('div', { class: 'chat-thread', 'aria-live': 'polite' });
+  const input = el('textarea', { class: 'input', rows: '2', placeholder: 'Tulis balasan…' });
+  const internal = el('input', { type: 'checkbox', id: 'chatInternal' });
+  const send = el('button', { class: 'btn btn--primary', type: 'submit' }, 'Kirim');
+  const statusSelect = el(
+    'select',
+    {
+      class: 'input',
+      'aria-label': 'Status percakapan',
+      onChange: async (event) => {
+        if (!active) return;
+        try {
+          await post(`/api/v1/admin/chat/${active.id}/status`, { status: event.target.value });
+          toast({ title: 'Status diperbarui', type: 'info' });
+          await loadList();
+        } catch (error) {
+          toast({ title: 'Gagal', message: error.message, type: 'error' });
+        }
+      },
+    },
+    el('option', { value: 'open' }, 'open'),
+    el('option', { value: 'pending' }, 'pending'),
+    el('option', { value: 'closed' }, 'closed'),
+  );
+  const prioritySelect = el(
+    'select',
+    {
+      class: 'input',
+      'aria-label': 'Prioritas',
+      onChange: async (event) => {
+        if (!active) return;
+        try {
+          await post(`/api/v1/admin/chat/${active.id}/priority`, { priority: event.target.value });
+          toast({ title: 'Prioritas diperbarui', type: 'info' });
+          await loadList();
+        } catch (error) {
+          toast({ title: 'Gagal', message: error.message, type: 'error' });
+        }
+      },
+    },
+    el('option', { value: 'low' }, 'low'),
+    el('option', { value: 'normal' }, 'normal'),
+    el('option', { value: 'high' }, 'high'),
+  );
+
+  let conversations = [];
+  let active = null;
+
+  const form = el(
+    'form',
+    {
+      class: 'chat-composer',
+      onSubmit: async (event) => {
+        event.preventDefault();
+        if (!active || !input.value.trim()) return;
+        send.disabled = true;
+        try {
+          await post(`/api/v1/admin/chat/${active.id}/messages`, {
+            body: input.value.trim(),
+            internal: internal.checked,
+          });
+          input.value = '';
+          await loadThread();
+          await loadList();
+        } catch (error) {
+          toast({ title: 'Gagal mengirim', message: error.message, type: 'error' });
+        } finally {
+          send.disabled = false;
+        }
+      },
+    },
+    input,
+    el(
+      'div',
+      { class: 'chat-actions' },
+      el('label', { class: 'checkbox' }, internal, el('span', {}, 'Catatan internal')),
+      send,
+    ),
+  );
+
+  const loadThread = async () => {
+    if (!active) return;
+    const data = await get(`/api/v1/admin/chat/${active.id}`).catch(() => ({ messages: [] }));
+    clear(threadBox);
+    for (const message of data.messages ?? []) {
+      threadBox.append(
+        el(
+          'div',
+          {
+            class: `bubble ${message.internal ? 'bubble--internal' : `bubble--${message.senderRole === 'staff' ? 'staff' : 'user'}`}`,
+          },
+          el('div', {}, message.body),
+          el(
+            'div',
+            { class: 'bubble__meta' },
+            `${message.internal ? 'catatan internal' : message.senderRole} · ${dateTime(message.createdAt)}`,
+          ),
+        ),
+      );
+    }
+    threadBox.scrollTop = threadBox.scrollHeight;
+  };
+
+  const loadList = async () => {
+    const data = await get('/api/v1/admin/chat').catch(() => ({ conversations: [] }));
+    conversations = data.conversations ?? [];
+    clear(listBox);
+    if (!conversations.length) {
+      listBox.append(emptyState('Kotak masuk kosong', 'Pesan pengguna akan muncul di sini.'));
+      return;
+    }
+    if (!active) active = conversations[0];
+    for (const conversation of conversations) {
+      listBox.append(
+        el(
+          'button',
+          {
+            type: 'button',
+            class: `chat-item ${conversation.id === active.id ? 'is-active' : ''}`,
+            onClick: async () => {
+              active = conversation;
+              await loadList();
+              await loadThread();
+            },
+          },
+          el(
+            'div',
+            { class: 'spread' },
+            el('strong', {}, conversation.subject),
+            el('span', { class: 'small muted' }, conversation.status),
+          ),
+          el(
+            'div',
+            { class: 'small muted' },
+            `${conversation.userEmail ?? conversation.userId} · ${conversation.priority}`,
+          ),
+          el('div', { class: 'small muted' }, conversation.lastMessage ?? ''),
+          conversation.unreadStaff > 0
+            ? el('span', { class: 'pill pill--up' }, `${conversation.unreadStaff} baru`)
+            : null,
+        ),
+      );
+    }
+    if (active) {
+      statusSelect.value = active.status;
+      prioritySelect.value = active.priority;
+      await loadThread();
+    }
+  };
+
+  panel.append(
+    el(
+      'div',
+      { class: 'chat-layout' },
+      listBox,
+      el(
+        'div',
+        { class: 'chat-panel' },
+        threadBox,
+        form,
+        el('div', { class: 'chip-row', style: { padding: '0 12px 12px' } }, statusSelect, prioritySelect),
+      ),
+    ),
+  );
+  await loadList();
+}
+
+// --------------------------------------------------------------- site & flags
+async function renderSite(panel) {
+  panel.append(head('Situs & fitur', 'Branding, teks beranda, mode maintenance dan feature flag.'));
+  const data = await get('/api/v1/admin/site');
+  const site = data.site ?? {};
+  const flags = data.flags ?? {};
+
+  const field = (label, input) => el('label', { class: 'field' }, el('span', {}, label), input);
+  const branding = site.branding ?? {};
+  const landing = site.landing ?? {};
+  const maintenance = site.maintenance ?? {};
+
+  const name = el('input', { class: 'input', value: branding.name ?? '' });
+  const description = el('input', { class: 'input', value: branding.description ?? '' });
+  const heroTitle = el('input', { class: 'input', value: landing.heroTitle ?? '' });
+  const heroSubtitle = el('textarea', { class: 'input', rows: '2' }, landing.heroSubtitle ?? '');
+  const maintenanceOn = el('input', { type: 'checkbox', checked: Boolean(maintenance.enabled) });
+  const maintenanceMessage = el('input', { class: 'input', value: maintenance.message ?? '' });
+
+  const save = el(
+    'button',
+    {
+      class: 'btn btn--primary',
+      type: 'button',
+      onClick: async () => {
+        try {
+          await patch('/api/v1/admin/site', {
+            branding: { name: name.value.trim(), description: description.value.trim() },
+            landing: { heroTitle: heroTitle.value.trim(), heroSubtitle: heroSubtitle.value.trim() },
+            maintenance: { enabled: maintenanceOn.checked, message: maintenanceMessage.value.trim() },
+          });
+          toast({ title: 'Pengaturan situs disimpan', type: 'win' });
+        } catch (error) {
+          toast({ title: 'Gagal menyimpan', message: error.message, type: 'error' });
+        }
+      },
+    },
+    'Simpan',
+  );
+
+  const flagRows = Object.entries(flags).map(([key, value]) => {
+    const toggle = el('input', {
+      type: 'checkbox',
+      checked: Boolean(value),
+      onChange: async (event) => {
+        try {
+          await patch(`/api/v1/admin/site/flags/${key}`, { enabled: event.target.checked });
+          toast({ title: `Flag ${key} diperbarui`, type: 'info' });
+        } catch (error) {
+          event.target.checked = !event.target.checked;
+          toast({ title: 'Gagal', message: error.message, type: 'error' });
+        }
+      },
+    });
+    return el(
+      'div',
+      { class: 'spread' },
+      el('span', { class: 'mono' }, key),
+      el('label', { class: 'checkbox' }, toggle, el('span', {}, value ? 'aktif' : 'nonaktif')),
+    );
+  });
+
+  panel.append(
+    el(
+      'div',
+      { class: 'grid grid--2' },
+      el(
+        'section',
+        { class: 'card' },
+        el('h2', { class: 'card__title' }, 'Branding & beranda'),
+        field('Nama platform', name),
+        field('Deskripsi', description),
+        field('Judul hero', heroTitle),
+        field('Subjudul hero', heroSubtitle),
+        save,
+      ),
+      el(
+        'section',
+        { class: 'card' },
+        el('h2', { class: 'card__title' }, 'Maintenance'),
+        el('label', { class: 'checkbox' }, maintenanceOn, el('span', {}, 'Aktifkan mode maintenance')),
+        field('Pesan maintenance', maintenanceMessage),
+        el('p', { class: 'small muted' }, 'Saat aktif, API publik mengembalikan 503 kecuali untuk staf.'),
+        el('h2', { class: 'card__title', style: { marginTop: '16px' } }, 'Feature flag'),
+        ...flagRows,
       ),
     ),
   );

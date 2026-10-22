@@ -197,11 +197,34 @@ describe('static shell', () => {
       'home.js',
       'notifications.js',
       'trading.js',
+      'platform.js',
+      'finance.js',
+      'chat.js',
     ];
     for (const file of files) {
       const source = readFileSync(path.join(dir, file), 'utf8');
       expect(source.length).toBeGreaterThan(200);
     }
+  });
+
+  it('ships the v4 routes in the client router', async () => {
+    const app = await (await import('node:fs/promises')).readFile(path.resolve('public/js/app.js'), 'utf8');
+    for (const route of [
+      "'/platform'",
+      "'/dashboard'",
+      "'/deposit'",
+      "'/withdraw'",
+      "'/transactions'",
+      "'/payment-status'",
+      "'/live-chat'",
+      "'/adminpages'",
+      "'/market/:symbol'",
+    ]) {
+      expect(app).toContain(route);
+    }
+    const css = await (await import('node:fs/promises')).readFile(path.resolve('public/css/app.css'), 'utf8');
+    expect(css).toContain('.chat-layout');
+    expect(css).toContain('.quick-action');
   });
 });
 
@@ -274,7 +297,9 @@ describe('browser app', () => {
 
     const document = dom.window.document;
     const amount = document.querySelector('.amount-input input') as HTMLInputElement;
-    amount.value = '10';
+    // new accounts default to IDR, whose minimum ticket is much larger than USD's
+    const displayCurrency = dom.window.document.querySelector('.amount-input__ccy')?.textContent?.trim();
+    amount.value = displayCurrency === 'IDR' ? '100000' : '10';
     amount.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 100));
 
@@ -327,6 +352,49 @@ describe('browser app', () => {
     await waitFor('.admin-layout', 10_000);
     expect(document.querySelector('.admin-nav')!.textContent).toContain('Pengguna');
     expect(document.querySelector('.admin-nav')!.textContent).toContain('Sistem');
+  });
+
+  it('renders the v4 platform, finance and chat pages', async () => {
+    const router = (dom.window as unknown as { router: { go: (path: string) => Promise<void> } }).router;
+    const document = dom.window.document;
+
+    await router.go('/platform');
+    await waitFor('.quick-grid', 10_000);
+    expect(document.getElementById('view')!.textContent).toContain('SIMULASI / DEMO');
+    expect(document.querySelectorAll('.wallet-card').length).toBeGreaterThanOrEqual(3);
+
+    await router.go('/dashboard');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(document.querySelector('.page-head h1')?.textContent).toContain('Dashboard Akun');
+
+    await router.go('/deposit');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await waitFor('form');
+    expect(document.getElementById('view')!.textContent).toContain('Deposit Demo');
+    expect(document.getElementById('view')!.textContent).toContain('SIMULASI');
+
+    await router.go('/withdraw');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await waitFor('form');
+    expect(document.getElementById('view')!.textContent).toContain('Penarikan Demo');
+
+    await router.go('/transactions');
+    await waitFor('.page-head');
+    expect(document.getElementById('view')!.textContent).toContain('Transaksi');
+
+    await router.go('/payment-status');
+    await waitFor('.page-head');
+    expect(document.getElementById('view')!.textContent).toContain('Status Pembayaran');
+
+    await router.go('/live-chat');
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await waitFor('.chat-layout');
+    expect(document.getElementById('view')!.textContent).toContain('Live Chat');
+
+    await router.go('/adminpages/deposits');
+    await waitFor('.admin-layout', 10_000);
+    expect(document.querySelector('.admin-nav')!.textContent).toContain('Penarikan');
+    expect(document.querySelector('.admin-nav')!.textContent).toContain('Mata uang');
   });
 
   it('did not produce unhandled browser errors', () => {

@@ -4,6 +4,86 @@ Format: [Keep a Changelog](https://keepachangelog.com/id/1.1.0/); versi
 mengikuti `package.json`. Proyek ini demo-only — tidak pernah ada rilis yang
 menangani uang nyata.
 
+## [4.0.0] — 2026-10-22
+
+**Cakupan §0 diperluas secara eksplisit** (lihat `DECISIONS.md` §20): deposit
+KlikQRIS dan penarikan **demo** dengan verifikasi manual, live chat, admin mata
+uang, dan rekonsiliasi. Semua uang tetap virtual; harga & hasil trade tetap
+ditentukan server simulasi dan admin tidak dapat mengubah hasil satu trade.
+
+### Ditambahkan — backend
+
+- Migrasi `003_v4.sql`: `currencies` (IDR aktif; USD/USDT tertutup untuk dana),
+  `payment_deposits`, `payment_callbacks`, `withdrawals`, `withdrawal_events`,
+  `support_conversations`, `support_messages`, `site_settings`, `feature_flags`,
+  serta `wallets.locked_minor` untuk saldo tertahan.
+- `src/payments/klikqris.ts`: klien server-side (`create`, `statusOnce`,
+  `history`, `testConnection`), transport injectable untuk tes, masking
+  kredensial, dan `verifyCallbackSignature` HMAC-SHA256 yang **fail closed**.
+- `src/services/currencies.ts`: aktif/nonaktif, limit, biaya, kurs + sumber,
+  audit setiap perubahan; deaktivasi mematikan flag turunan.
+- `src/services/deposits.ts`: invoice QRIS (`total_amount` + kode unik),
+  deposit manual (`review`), sinkronisasi status (cooldown 3 s), callback
+  idempoten, `expireStale`, `reconcile`, statistik.
+- `src/services/withdrawals.ts`: `quote`, `request` (hold via `lockFunds`),
+  `cancel` (release), transisi admin `review/approve/process/complete/reject`
+  dengan `transferRef`, `withdrawal_events` + audit, tujuan disamarkan.
+- `src/services/chat.ts`: percakapan per user, pesan idempoten (`clientId`),
+  catatan internal, status/prioritas/assign, push `chat:*` ke staf.
+- `src/services/site.ts`: `site_settings` (branding, landing, SEO, legal,
+  maintenance) + feature flag (`deposits`, `withdrawals`, `live_chat`,
+  `demo_topup`, `registrations`), semuanya diaudit.
+- `src/services/wallets.ts`: `locked_minor`, `lockFunds`/`releaseFunds`/
+  `settleLocked`, tersedia = saldo − tertahan, tanpa saldo negatif.
+- Rute baru: `finance.ts` (site, currencies, deposit, penarikan, transaksi),
+  `chat.ts`, `webhooks.ts`, `adminV4.ts`; maintenance gate dan mounting baru di
+  `http/app.ts`; notifikasi & WS baru (`deposit:updated`, `withdrawal:updated`,
+  `chat:message`, `chat:new`, `sendToStaff`).
+- Peran baru **`finance`** + izin `deposits.*`, `withdrawals.*`,
+  `currencies.write`, `chat.*`, `payments.write`, `site.write`, `flags.write`.
+- Seed: staf `finance@simtrade.local` (`finance-demo-123`); kata sandi staf
+  lain diselaraskan dengan README (`support-demo-123`, `operator-demo-123`).
+- Default mata uang tampilan pengguna baru = **IDR**; trading memakai kurs
+  server (bukan angka hard-coded).
+
+### Ditambahkan — frontend
+
+- Halaman `/platform` dan `/dashboard` (ringkasan dompet, trade terbuka,
+  aktivitas, aksi cepat).
+- `/deposit` (QRIS + transfer manual, payload QRIS disalin sebagai teks,
+  polling status), `/withdraw` (quote biaya, hold, pembatalan), `/transactions`,
+  `/payment-status`, `/live-chat`, alias `/order-history`, `/profile-security`,
+  `/market/:symbol`, `/adminpages(/:section)`.
+- Panel admin baru: antrian deposit, penarikan, mata uang, live chat inbox,
+  situs & feature flag; panel pembayaran ditulis ulang (status provider,
+  tes koneksi, rekonsiliasi, callback).
+- CSS v4 untuk dashboard, deposit, chat, dan tabel; navigasi mengikuti feature
+  flag; tema gelap tetap default.
+
+### Diubah
+
+- `GET /config` memuat `site`, `payments`, `activeCurrencies`, dan `features`
+  yang mengikuti flag.
+- `GET /wallet` mengembalikan `locked`, `available`, dan status aktif mata uang.
+- `POST /trades` menolak mata uang yang `trading_enabled = 0`
+  (`CURRENCY_NOT_AVAILABLE`).
+- Endpoint `/payments/*` v3 tetap ada sebagai stub `NOT_AVAILABLE` (klien lama),
+  bukan jalur pembayaran.
+
+### Keamanan
+
+- Webhook hanya menerima HMAC-SHA256; tanpa `KLIKQRIS_WEBHOOK_SECRET` semua
+  callback ditolak `401`. Setiap callback (valid/tidak) dicatat.
+- Tidak ada API key/secret di frontend, log, atau respons; hanya masked ID.
+- Semua mutasi uang memakai transaksi DB + ledger append-only + idempotensi.
+
+### Diketahui / blocker
+
+- Algoritma signature KlikQRIS **belum terverifikasi** → callback tidak dapat
+  diterima sampai skema dikonfirmasi; gunakan verifikasi manual / cek status /
+  rekonsiliasi.
+- Playwright E2E belum dijalankan (browser tidak dapat diunduh di sandbox).
+
 ## [3.0.0] — 2026-10-22
 
 Rilis “lengkap” pertama: platform demo end-to-end (API, realtime, UI, admin,

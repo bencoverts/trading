@@ -3,9 +3,20 @@
 Setiap entri: konteks → keputusan → konsekuensi. Keputusan yang masih terbuka
 ada di bagian akhir.
 
+> **PEMBARUAN v4 (2026-10-22) — §0 dan §14 DIGANTIKAN SECARA EKSPLISIT.**
+> Permintaan v4 memperluas cakupan: deposit **KlikQRIS (demo)**, penarikan
+> dengan saldo tertahan + proses manual admin, live chat, rekonsiliasi, dan
+> admin mata uang. §0 dan tabel “fase berikutnya” di §14 **tidak dihapus**
+> (riwayat tetap utuh) tetapi **tidak lagi berlaku**. Batasan yang **tetap**
+> berlaku: harga & hasil trade tetap ditentukan server simulasi, admin tidak
+> boleh mengubah hasil satu trade, label **SIMULASI / DEMO** tetap ada di
+> setiap halaman trading dan setiap payload API. Lihat §20–§27 untuk keputusan
+> v4, termasuk **celah algoritma signature KlikQRIS** yang membuat callback
+> ditolak secara default (fail closed).
+
 ---
 
-## 0. Batas produk: simulasi saja
+## 0. Batas produk: simulasi saja — **DIGANTIKAN oleh §20 (v4)**
 
 **Konteks.** Meminta pembangunan platform trading biner “lengkap” berisiko
 dibaca sebagai izin membangun layanan beruang nyata.
@@ -150,7 +161,12 @@ saldo punya cooldown 300 detik. Semua masuk ledger. Tidak ada konsep “deposit�
 jalur utama adalah cookie + CSRF. CSP memblokir skrip inline; semua JS dimuat
 dari `/js/*`.
 
-## 14. Fase berikutnya (di luar §0, sengaja belum dibuat)
+## 14. Fase berikutnya (di luar §0, sengaja belum dibuat) — **DIGANTIKAN oleh §20 (v4)**
+
+> Catatan v4: deposit, penarikan, QRIS, live chat, rekonsiliasi dan admin mata
+> uang **sudah dikerjakan** sebagai alur demo (§20–§27). Yang masih belum:
+> dana nyata, KYC/AML, harga bursa, multi-instance, SMTP nyata, antrian job
+> terpisah, dan penyimpanan audit WORM.
 
 | Item                                                           | Alasan belum dibuat                                    |
 | -------------------------------------------------------------- | ------------------------------------------------------ |
@@ -208,3 +224,123 @@ mati = tidak ada settlement sampai hidup lagi (lalu catch-up).
 7. **PWA/offline** — belum ada service worker.
 8. **Screenshot** — belum diambil di sesi ini (sandbox tanpa browser); lihat
    `TEST-REPORT.md`.
+
+---
+
+# Bagian v4 (mulai 2026-10-22)
+
+## 20. Cakupan v4: deposit/penarikan/live chat **demo** menggantikan §0
+
+**Konteks.** User meminta deposit KlikQRIS, penarikan, verifikasi manual,
+live chat, admin mata uang, dan rekonsiliasi — hal yang dilarang §0 v3.
+**Keputusan.** Fitur tersebut dibangun, tetapi tetap **demo**:
+
+- KlikQRIS hanya dipanggil **server-side** (`src/payments/klikqris.ts`), dengan
+  kredensial dari env. Browser tidak pernah memanggil provider.
+- Tidak ada saldo yang bertambah sebelum verifikasi server; “sukses” di UI
+  hanya muncul setelah status dari provider atau persetujuan admin.
+- `PaymentService.describe().liveMoney` selalu `false` dan ditampilkan di UI.
+- Label **SIMULASI** ada di halaman deposit, penarikan, status pembayaran, chat,
+  dan setiap respons API terkait uang.
+  **Konsekuensi.** §0 dan §14 tidak lagi berlaku. Risiko hukum/izin tetap ada
+  jika kode ini diarahkan ke dana nyata; README memperingatkan hal ini.
+
+## 21. Mata uang: IDR aktif, USD/USDT nonaktif, kurs tidak boleh ditebak
+
+**Keputusan.** `003_v4.sql` mengaktifkan **IDR** untuk deposit/penarikan/trading.
+**USD** tetap `trading_enabled = 1` karena engine simulasi dan riwayat harga
+berbasis USD, tetapi `deposit_enabled = withdrawal_enabled = 0` (tidak bisa
+diisi/ditarik). **USDT** sepenuhnya nonaktif. Setiap mata uang punya
+`fx_rate_to_idr` + `fx_source` (default `demo:static`), dan admin wajib mengisi
+sumber saat mengubah kurs.
+**Alasan.** Melarang semua penggunaan USD akan memaksa migrasi ulang data
+simulasi dan menghapus fitur yang sudah bekerja; yang penting adalah **tidak
+ada aliran uang** ke/dari USD. Menonaktifkan mata uang **tidak menghapus
+saldo**; trade baru pada mata uang nonaktif ditolak server
+(`CURRENCY_NOT_AVAILABLE`).
+**Konsekuensi.** Konversi memakai kurs yang tersimpan, bukan kurs yang diasumsikan;
+UI menampilkan sumber kurs.
+
+## 22. Peran: tambah `finance`, jangan ganti nama peran lama
+
+**Konteks.** v4 meminta `super_admin, admin, finance, support, user`. Build ini
+sudah punya `super_admin, operator, support, viewer` (dan `user` = tanpa peran staf).
+**Keputusan.** Tambah **`finance`**; `operator` dipertahankan sebagai admin
+market/trade; `viewer` dipertahankan read-only. Pemetaan:
+
+| Diminta                                                                         | Di build ini                        | Catatan                                            |
+| ------------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------- |
+| super_admin                                                                     | `super_admin`                       | semua izin, satu-satunya yang bisa ubah peran      |
+| admin                                                                           | `operator` (+ `finance` untuk uang) | sengaja dipisah agar market ≠ keuangan             |
+| finance                                                                         | `finance` (baru)                    | deposit review, penarikan, mata uang, rekonsiliasi |
+| support                                                                         | `support`                           | chat, baca user/trade, tidak bisa uang             |
+| user                                                                            | tanpa `staff_role`                  | pengguna biasa                                     |
+| **Konsekuensi.** Izin baru: `deposits.read/review`, `withdrawals.read/process`, |
+| `currencies.write`, `chat.read/write`, `payments.write`, `site.write`,          |
+| `flags.write`. Matriks di `src/auth/permissions.ts` ditegakkan **server-side**; |
+| menu yang disembunyikan bukan keamanan.                                         |
+
+## 23. Signature callback KlikQRIS: **fail closed**, tidak menebak
+
+**Konteks.** Dokumentasi yang tersedia menyebut `signature` pada respons
+`/qris/create` tetapi **tidak** mendefinisikan algoritma signature callback.
+**Keputusan.** Implementasi hanya menerima HMAC-SHA256 atas
+`order_id|status|amount|merchant_id` dengan secret `KLIKQRIS_WEBHOOK_SECRET`,
+dikirim pada header `KLIKQRIS_SIGNATURE_HEADER` (default
+`x-callback-signature`, fallback `x-signature`/`signature`). Jika secret tidak
+diset → **semua callback ditolak 401**. Tidak ada “mode percaya” tersembunyi.
+Perbandingan memakai `timingSafeEqual`. Setiap callback (valid/invalid) dicatat
+di `payment_callbacks` dengan `accepted` + `reason`.
+**Konsekuensi.** Tanpa konfirmasi skema dari KlikQRIS, **callback pembayaran
+tidak akan pernah diterima**. Alur yang tetap aman: cek status manual
+(`POST /deposits/:id/check`, dibatasi 3 detik), rekonsiliasi admin
+(`POST /admin/payments/reconcile`), atau **verifikasi manual admin** untuk
+deposit transfer manual. Celah ini tercatat sebagai blocker #1 di README dan
+`update.md`.
+
+## 24. Deposit: `total_amount`, kode unik, dan idempotensi
+
+- `POST /deposits` membuat invoice server-side dengan `Idempotency-Key` opsional
+  namun **disarankan**; replay mengembalikan invoice yang sama (`reused: true`).
+- Yang ditampilkan ke pengguna adalah **`total_amount`** dari provider (termasuk
+  `amount_uniq`), bukan nominal yang diminta. UI menampilkan keduanya.
+- Callback `paid` mengkredit **`total_amount`** (bukan `amount`) dan hanya bila
+  nominal cocok dengan invoice (`AMOUNT_MISMATCH` → 409, tanpa kredit).
+- Kredit terjadi di dalam satu transaksi, idempoten (unique
+  `payment_deposits.provider_order_id` + status guard), dan menulis **satu**
+  baris ledger `kind='deposit'`.
+- Deposit manual (`POST /deposits/manual`) masuk status `review`; saldo hanya
+  bertambah setelah admin `approve` (wajib alasan saat `reject`).
+- Expiry 15 menit; `expireStale` menutup invoice kedaluwarsa.
+
+## 25. Penarikan: saldo tertahan, bukan langsung didebit
+
+**Keputusan.** `POST /withdrawals` memindahkan dana ke `wallets.locked_minor`
+(`lockFunds`, `BEGIN IMMEDIATE` + cek `balance − locked`), status `pending`,
+dan **tidak** mengurangi saldo total. Debit nyata terjadi saat admin
+menyelesaikan (`completed`), yang memakai `settleLocked`. `reject` dan
+`cancel` memanggil `releaseFunds` **tepat sekali** (status guard).
+Transisi yang diizinkan: `pending → approved|review|rejected|cancelled`,
+`approved → processing|rejected`, `processing → completed|rejected`.
+Setiap transisi menulis `withdrawal_events` + audit (aktor, aksi, objek,
+alasan, hasil). Nomor rekening **disamarkan** di semua respons (`••••7890`)
+dan hash-nya disimpan terpisah; data mentah tidak pernah masuk log.
+**Konsekuensi.** Tidak ada kemungkinan saldo negatif; uji konkurensi menahan
+tiga penarikan paralel dengan saldo terbatas.
+
+## 26. Live chat: pesan dipersist sebelum di-stream
+
+- Percakapan milik user ditegakkan di service (`CHAT_FORBIDDEN`), bukan di UI.
+- `clientId` unik per percakapan → pengiriman ulang tidak menggandakan pesan.
+- Catatan internal (`internal: true`) disimpan pada thread yang sama tetapi
+  **disaring** dari respons user.
+- Staf menerima `chat:new` / `chat:message` lewat `sendToStaff` (role staf).
+- Fitur dapat dimatikan via flag `live_chat` → 503, bukan error 500.
+
+## 27. Rekonsiliasi & job
+
+`DepositService.expireStale()` (job 5 menit) menutup invoice kedaluwarsa.
+`reconcile()` mengambil riwayat provider, memeriksa invoice lokal yang masih
+`pending`, dan melaporkan transaksi yang **hanya ada di provider** tanpa
+mengarang kredit. Semua panggilan provider memiliki timeout dan tidak
+menghentikan request lain saat gagal.

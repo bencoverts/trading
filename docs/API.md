@@ -1,4 +1,4 @@
-# API Reference (v3)
+# API Reference (v3 + v4)
 
 Semua endpoint berada di bawah `/api/v1`. Setiap payload pasar/trade memuat
 `"simulation": true`; payload publik juga memuat `"label": "SIMULASI"`.
@@ -292,7 +292,11 @@ bila sama → refund penuh. `closePrice`, `settledBy` (`expiry`/`admin`), dan
 | `GET /pages/:slug` | `faq`, `terms`, `privacy`, `contact` |
 | `GET /banners`     | banner aktif dalam jadwal            |
 
-## 7. Pembayaran (sengaja mati)
+## 7. Pembayaran lama (warisan v3, dipensiunkan)
+
+> **v4:** modul ini **bukan** jalur pembayaran lagi. Deposit dan penarikan
+> nyata (demo) ada di §10–§12. Endpoint di bawah tetap ada agar klien lama
+> tidak crash, tetapi selalu menjawab “tidak tersedia”.
 
 | Method & path             | Hasil                                                  |
 | ------------------------- | ------------------------------------------------------ |
@@ -379,3 +383,159 @@ Pesan server:
 Ticks/candle digabung per klien pada `WS_TICK_MAX_PER_SEC` (default 15/detik);
 `candle_closed`, `trade:*`, dan `market_status` tidak pernah di-throttle.
 Koneksi dibatasi `WS_MAX_CONNECTIONS` (default 2000) dan diverifikasi origin.
+
+---
+
+# Bagian v4
+
+Semua endpoint di bawah tetap berada di `/api/v1` kecuali webhook
+(`/api/webhooks/klikqris`). Setiap respons uang memuat `simulation: true` dan
+`label: "SIMULASI"`. Tidak ada saldo yang berubah dari body request.
+
+## 10. Situs, mata uang & metode
+
+| Method & path           | Auth | Keterangan                                                                                                                                       |
+| ----------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /site`             | –    | branding, SEO, maintenance + `flags` (deposits, withdrawals, live_chat, …)                                                                       |
+| `GET /currencies`       | –    | `{ currencies: aktif, all: semua }` — `active`, `depositEnabled`, `withdrawalEnabled`, `tradingEnabled`, limit, biaya, `fxRateToIdr`, `fxSource` |
+| `GET /deposits/methods` | –    | provider KlikQRIS (masked) + metode `klikqris` / `manual` + mata uang yang bisa didanai                                                          |
+
+`GET /config` (v3) kini juga memuat `site`, `payments` (masked) dan `features`
+yang mengikuti feature flag.
+
+## 11. Deposit
+
+| Method & path              | Auth | Keterangan                                                                                            |
+| -------------------------- | ---- | ----------------------------------------------------------------------------------------------------- |
+| `POST /deposits`           | user | buat invoice QRIS; body `{currency, amount}`; `Idempotency-Key` opsional → replay `200 {reused:true}` |
+| `POST /deposits/manual`    | user | transfer manual; body `{currency, amount, reference, note?, proofPath?}` → status `review`            |
+| `GET /deposits`            | user | riwayat milik sendiri                                                                                 |
+| `GET /deposits/:id`        | user | detail (404 untuk milik orang lain)                                                                   |
+| `POST /deposits/:id/check` | user | sinkronisasi status ke provider (cooldown 3 s)                                                        |
+
+Respons deposit: `id, orderId, currency, method, amount, amountMinor,
+uniqueAmount, totalAmount, totalAmountMinor, status, providerStatus, qrisUrl,
+qrisImage, reportUrl, expiresAt, paidAt, creditedAt, reference, note,
+proofUrl, createdAt`.
+
+Status: `pending | paid | expired | failed | cancelled | review | rejected`.
+**Saldo hanya bertambah saat `paid`** (callback valid atau persetujuan admin).
+
+Contoh:
+
+```http
+POST /api/v1/deposits
+Idempotency-Key: dep-2026-0001
+Content-Type: application/json
+
+{ "currency": "IDR", "amount": 50000 }
+```
+
+```json
+{
+  "deposit": {
+    "id": "…",
+    "orderId": "DEP-…",
+    "status": "pending",
+    "amount": 50000,
+    "totalAmount": 50077,
+    "uniqueAmount": 77,
+    "qrisUrl": "https://…",
+    "expiresAt": 1792684800000,
+    "simulation": true
+  },
+  "reused": false
+}
+```
+
+## 12. Penarikan
+
+| Method & path                  | Auth | Keterangan                                                               |
+| ------------------------------ | ---- | ------------------------------------------------------------------------ |
+| `GET /withdrawals/quote`       | user | `?currency=IDR&amount=100000` → `{amountMinor, feeMinor, netMinor}`      |
+| `POST /withdrawals`            | user | body `{currency, method, amount, destination}` → `201`, dana **ditahan** |
+| `GET /withdrawals`, `/:id`     | user | riwayat & detail milik sendiri                                           |
+| `POST /withdrawals/:id/cancel` | user | hanya saat `pending`/`review`; melepas hold                              |
+
+`method`: `bank_transfer` (`bank`, `accountNumber`, `accountName`) atau
+`ewallet` (`provider`, `phone`). Respons memuat `destinationMasked` — nomor
+lengkap tidak pernah dikembalikan. Status: `pending | review | approved |
+processing | completed | rejected | cancelled`.
+
+## 13. Transaksi
+
+`GET /transactions?limit&currency&kind` → `{ ledger, deposits, withdrawals, wallets }`.
+Entri ledger: `{id, currency, kind, direction, amount, amountMinor,
+balanceAfter, balanceAfterMinor, refType, refId, note, createdAt}`.
+
+## 14. Live chat
+
+| Method & path             | Auth | Keterangan                                                |
+| ------------------------- | ---- | --------------------------------------------------------- |
+| `GET /chat`               | user | daftar percakapan + `enabled`                             |
+| `POST /chat`              | user | mulai/lanjutkan percakapan (`subject`)                    |
+| `GET /chat/:id/messages`  | user | pesan (catatan internal disaring)                         |
+| `POST /chat/:id/messages` | user | `{body, clientId?, attachmentUrl?}`; `clientId` idempoten |
+| `POST /chat/:id/upload`   | user | multipart `file` (PNG/JPEG/WEBP, ≤512 KB) → `{url}`       |
+| `POST /chat/:id/close`    | user | tutup percakapan                                          |
+
+Percakapan milik orang lain → `403 CHAT_FORBIDDEN`. Percakapan tertutup
+menolak pesan baru → `403`; user dapat memulai percakapan baru.
+
+## 15. Webhook provider
+
+`POST /api/webhooks/klikqris` (tanpa sesi, tanpa CSRF) — signature wajib:
+
+```http
+POST /api/webhooks/klikqris
+x-callback-signature: <hex hmac-sha256(order_id|status|total_amount|merchant_id)>
+
+{ "order_id": "DEP-…", "status": "paid", "total_amount": 50077 }
+```
+
+| Kondisi                       | Respons                                         |
+| ----------------------------- | ----------------------------------------------- |
+| signature tidak ada / salah   | `401 SIGNATURE_INVALID` (tidak ada kredit)      |
+| order tidak dikenal           | `404` (tetap dicatat di `payment_callbacks`)    |
+| nominal ≠ invoice             | `409 AMOUNT_MISMATCH`                           |
+| `paid` valid                  | `200 {ok:true, duplicate:false, status:"paid"}` |
+| retry `paid`                  | `200 {ok:true, duplicate:true}`                 |
+| `expired` / `cancelled` valid | `200`, status diperbarui, tanpa kredit          |
+
+**Celah yang diketahui:** algoritma signature tidak didefinisikan di dokumen
+provider yang tersedia → implementasi hanya HMAC-SHA256 di atas, dan
+**menolak semua callback bila `KLIKQRIS_WEBHOOK_SECRET` kosong**. Lihat
+`docs/DECISIONS.md` §23.
+
+## 16. Admin v4 (izin server-side)
+
+| Method & path                                   | Izin                           | Keterangan                                                            |
+| ----------------------------------------------- | ------------------------------ | --------------------------------------------------------------------- |
+| `GET /admin/currencies`                         | `finance.read`                 | semua mata uang + status                                              |
+| `PATCH /admin/currencies/:code`                 | `currencies.write`             | aktif/limit/biaya/kurs; deaktivasi mematikan semua flag turunan       |
+| `GET /admin/deposits`, `/:id`                   | `deposits.read`                | antrian + callback                                                    |
+| `POST /admin/deposits/:id/review`               | `deposits.review`              | `{action:"approve"\|"reject", reason?}` (alasan wajib saat reject)    |
+| `GET /admin/withdrawals`, `/:id`                | `withdrawals.read`             | antrian + `events`                                                    |
+| `GET /admin/withdrawals/export.csv`             | `withdrawals.read`             | CSV (tanpa nomor rekening penuh)                                      |
+| `POST /admin/withdrawals/:id/transition`        | `withdrawals.process`          | `review\|approve\|process\|complete\|reject` + `transferRef`/`reason` |
+| `GET /admin/payments`                           | `payments.read`                | status provider (masked), statistik, callback                         |
+| `POST /admin/payments/test-connection`          | `payments.write`               | tes kredensial server-side                                            |
+| `POST /admin/payments/reconcile`                | `payments.write`               | cocokkan invoice lokal vs riwayat provider                            |
+| `GET /admin/payments/callbacks`                 | `payments.read`                | 100 callback terakhir                                                 |
+| `GET /admin/site`, `PATCH /admin/site`          | `settings.read` / `site.write` | branding, landing, maintenance, legal                                 |
+| `PATCH /admin/site/flags/:key`                  | `flags.write`                  | `deposits, withdrawals, live_chat, demo_topup, registrations`         |
+| `GET /admin/chat`, `/:id`                       | `chat.read`                    | kotak masuk + thread                                                  |
+| `POST /admin/chat/:id/messages`                 | `chat.write`                   | balasan / `internal:true`                                             |
+| `POST /admin/chat/:id/status\|priority\|assign` | `chat.write`                   | `open\|pending\|closed`, `low\|normal\|high`                          |
+| `GET /admin/ledger`, `/ledger/export.csv`       | `finance.read`                 | buku besar + total per mata uang                                      |
+
+**Maintenance:** bila `site.maintenance.enabled`, semua endpoint publik
+(termasuk pasar/trade) menjawab `503 MAINTENANCE_MODE`, kecuali `/auth/*`,
+`/site`, `/config`, `/healthz`, dan staf yang sudah login.
+
+## 17. WebSocket tambahan
+
+Pesan baru: `deposit:updated`, `withdrawal:updated`, `chat:message`,
+`chat:new`. Pesan `balance` kini juga memuat `locked/lockedMinor` dan
+`available/availableMinor` per dompet. Staf menerima event chat lewat
+`sendToStaff` setelah otentikasi socket dengan role staf.

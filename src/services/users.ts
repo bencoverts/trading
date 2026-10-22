@@ -162,7 +162,7 @@ export class UserService {
         `INSERT INTO users (id, email, email_normalized, username, username_normalized, password_hash, role,
                             email_verified_at, display_currency, token_version, created_at, updated_at,
                             terms_accepted_at, language, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'user', NULL, 'USD', 0, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'user', NULL, 'IDR', 0, ?, ?, ?, ?, ?)`,
         id,
         email,
         normalize(email),

@@ -28,7 +28,8 @@ test.describe('demo trading platform', () => {
     await expect(page.getByText('SIMULASI').first()).toBeVisible();
 
     const amount = page.locator('.amount-input input');
-    await amount.fill('10');
+    const currency = (await page.locator('.amount-input__ccy').first().textContent())?.trim();
+    await amount.fill(currency === 'IDR' ? '100000' : '10');
     await page.locator('.chip', { hasText: '5s' }).first().click();
     await page.getByRole('button', { name: /BELI/ }).first().click();
 

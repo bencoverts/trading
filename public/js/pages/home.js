@@ -3,6 +3,11 @@ import { state } from '../store.js';
 import { $, clear, el, emptyState, fmt, marketLogo, skeleton, toast } from '../ui.js';
 
 export async function homePage(ctx, { refreshSession } = {}) {
+  // signed-in visitors land on their platform dashboard, not the marketing page
+  if (state.user) {
+    await window.router.go('/platform');
+    return;
+  }
   const root = $('#view');
   clear(root);
   root.append(renderHero());
@@ -37,7 +42,7 @@ export async function homePage(ctx, { refreshSession } = {}) {
       el(
         'p',
         { class: 'dim' },
-        'Buat akun demo untuk mendapatkan saldo virtual USD, IDR, dan USDT. Tidak ada pembayaran sama sekali.',
+        'Buat akun demo untuk mendapatkan saldo virtual IDR, USD, dan USDT. Deposit demo (QRIS / transfer manual), penarikan demo, dan live chat tersedia — semuanya tanpa uang nyata.',
       ),
       el(
         'div',
@@ -71,6 +76,7 @@ function renderHero() {
         'div',
         { class: 'hero__actions' },
         el('a', { class: 'btn btn--primary', href: '/trading', 'data-link': '' }, 'Mulai trading demo'),
+        el('a', { class: 'btn btn--ghost', href: '/deposit', 'data-link': '' }, 'Deposit demo'),
         el('a', { class: 'btn btn--ghost', href: '/faq', 'data-link': '' }, 'Baca FAQ'),
       ),
     ),

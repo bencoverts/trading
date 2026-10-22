@@ -17,6 +17,9 @@ import { accountPage } from './pages/account.js';
 import { notificationsPage } from './pages/notifications.js';
 import { authPage } from './pages/auth.js';
 import { contentPage, notFoundPage } from './pages/content.js';
+import { platformPage } from './pages/platform.js';
+import { depositPage, paymentStatusPage, transactionsPage, withdrawPage } from './pages/finance.js';
+import { liveChatPage } from './pages/chat.js';
 
 const view = $('#view');
 const nav = $('#nav');
@@ -46,13 +49,16 @@ function applyLanguage(lang) {
 function renderNav() {
   clear(nav);
   const staff = Boolean(state.user?.staffRole);
+  const flags = state.config?.features ?? {};
   const items = [
-    { href: '/', label: t('nav.home') },
+    { href: state.user ? '/platform' : '/', label: state.user ? t('nav.platform') : t('nav.home') },
     { href: '/trading', label: t('nav.trade') },
+    ...(state.user && flags.deposits ? [{ href: '/deposit', label: t('nav.deposit') }] : []),
     ...(state.user ? [{ href: '/history', label: t('nav.history') }] : []),
+    ...(state.user && flags.liveChat ? [{ href: '/live-chat', label: t('nav.chat') }] : []),
     ...(state.user ? [{ href: '/account', label: t('nav.account') }] : []),
     ...(state.user ? [{ href: '/notifications', label: t('nav.notifications') }] : []),
-    ...(staff ? [{ href: '/admin', label: t('nav.admin') }] : []),
+    ...(staff ? [{ href: '/adminpages', label: t('nav.admin') }] : []),
   ];
   for (const item of items) {
     nav.append(
@@ -118,7 +124,7 @@ async function bootstrap() {
     setState({
       config,
       platform: config.platform,
-      displayCurrency: state.displayCurrency ?? config.currencies?.[0]?.code ?? 'USD',
+      displayCurrency: state.displayCurrency ?? config.activeCurrencies?.[0]?.code ?? 'IDR',
     });
     document.documentElement.style.setProperty('--accent', config.platform.accent);
     const prefersDark = !window.matchMedia?.('(prefers-color-scheme: light)').matches;
@@ -130,7 +136,7 @@ async function bootstrap() {
     const title = config.platform.name ?? 'SimTrade Demo';
     document.title = `${title} · Simulasi Trading`;
     const footerVersion = $('#footerVersion');
-    if (footerVersion) footerVersion.textContent = `v3 · ${config.label}`;
+    if (footerVersion) footerVersion.textContent = `v4 · ${config.label}`;
   } catch (error) {
     toast({ title: 'Gagal memuat konfigurasi', message: error.message, type: 'error' });
   }
@@ -184,8 +190,11 @@ async function bootstrap() {
   router = createRouter(
     [
       { path: '/', render: (ctx) => homePage(ctx, { refreshSession, renderHeader }) },
+      { path: '/platform', render: () => platformPage({ variant: 'platform' }) },
+      { path: '/dashboard', render: () => platformPage({ variant: 'dashboard' }) },
       { path: '/trading', render: (ctx) => tradingPage(ctx) },
       { path: '/trading/:symbol', render: (ctx) => tradingPage(ctx) },
+      { path: '/market/:symbol', render: (ctx) => tradingPage(ctx) },
       { path: '/history', render: (ctx) => historyPage(ctx) },
       { path: '/account', render: (ctx) => accountPage(ctx, { refreshSession, renderHeader }) },
       { path: '/notifications', render: (ctx) => notificationsPage(ctx) },
@@ -198,8 +207,13 @@ async function bootstrap() {
       { path: '/terms', render: (ctx) => contentPage(ctx, { slug: 'terms' }) },
       { path: '/privacy', render: (ctx) => contentPage(ctx, { slug: 'privacy' }) },
       { path: '/contact', render: (ctx) => contentPage(ctx, { slug: 'contact' }) },
-      { path: '/deposit', render: (ctx) => contentPage(ctx, { slug: 'payments', kind: 'deposit' }) },
-      { path: '/withdraw', render: (ctx) => contentPage(ctx, { slug: 'payments', kind: 'withdraw' }) },
+      { path: '/deposit', render: () => depositPage() },
+      { path: '/withdraw', render: () => withdrawPage() },
+      { path: '/payment-status', render: () => paymentStatusPage() },
+      { path: '/transactions', render: () => transactionsPage() },
+      { path: '/live-chat', render: () => liveChatPage() },
+      { path: '/order-history', render: (ctx) => historyPage(ctx) },
+      { path: '/profile-security', render: (ctx) => accountPage(ctx, { refreshSession, renderHeader }) },
       { path: '/shortcuts', render: (ctx) => contentPage(ctx, { slug: 'shortcuts' }) },
       {
         path: '/admin',
@@ -209,18 +223,40 @@ async function bootstrap() {
         path: '/admin/:section',
         render: (ctx) => loadAdmin(ctx, ctx.params.section),
       },
+      {
+        path: '/adminpages',
+        render: (ctx) => loadAdmin(ctx, ''),
+      },
+      {
+        path: '/adminpages/:section',
+        render: (ctx) => loadAdmin(ctx, ctx.params.section),
+      },
     ],
     {
       fallback: { path: '*', render: (ctx) => notFoundPage(ctx, router) },
       onBefore: (route) => {
-        const needsAuth = ['/account', '/history', '/notifications'].some((prefix) =>
-          location.pathname.startsWith(prefix),
-        );
+        const needsAuth = [
+          '/account',
+          '/history',
+          '/order-history',
+          '/profile-security',
+          '/notifications',
+          '/platform',
+          '/dashboard',
+          '/deposit',
+          '/withdraw',
+          '/transactions',
+          '/payment-status',
+          '/live-chat',
+        ].some((prefix) => location.pathname.startsWith(prefix));
         if (needsAuth && !state.user) {
           window.router.go('/login');
           return false;
         }
-        if (location.pathname.startsWith('/admin') && !state.user?.staffRole) {
+        if (
+          (location.pathname.startsWith('/admin') || location.pathname.startsWith('/adminpages')) &&
+          !state.user?.staffRole
+        ) {
           toast({ title: 'Akses ditolak', message: 'Halaman admin hanya untuk staf.', type: 'error' });
           router.go('/');
           return false;
@@ -232,7 +268,7 @@ async function bootstrap() {
         window.__activePage?.destroy?.();
         window.__activePage = null;
         clear(view);
-        view.classList.toggle('view--wide', pathname.startsWith('/admin'));
+        view.classList.toggle('view--wide', pathname.startsWith('/admin') || pathname.startsWith('/adminpages'));
         renderNav();
         window.scrollTo({ top: 0, behavior: 'instant' });
       },

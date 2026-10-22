@@ -218,3 +218,74 @@ memakai indeks `userId → sockets`.
 untuk auth, trade, konkurensi saldo, settlement, market API, admin, akses per
 peran, WS, dan UI jsdom. `e2e/` berisi Playwright (belum dijalankan di sandbox),
 `test/load/ws-load.mjs` untuk beban WS.
+
+---
+
+# Bagian v4 — modul uang demo, chat, dan konfigurasi
+
+```
+HTTP (Express)
+ ├─ /api/v1/site, /currencies           → SiteService, CurrencyService
+ ├─ /api/v1/deposits, /withdrawals      → DepositService, WithdrawalService
+ │                                         └─ WalletService (lock/settle) + LedgerService
+ ├─ /api/v1/chat                        → ChatService ──► WS sendToUser / sendToStaff
+ ├─ /api/webhooks/klikqris              → KlikQrisClient.verifyCallbackSignature
+ └─ /api/v1/admin/*                     → izin per peran (src/auth/permissions.ts)
+                                            └─ AuditService (recordAudit)
+```
+
+## Alur deposit
+
+```
+user → POST /deposits ─► DepositService.createQris
+        │                 ├─ CurrencyService.requireEnabled('deposit')
+        │                 ├─ KlikQrisClient.create  (server-side, API key dari env)
+        │                 └─ simpan invoice: amount, total_amount, amount_uniq
+        ▼
+   status pending ──► POST /deposits/:id/check ─► statusOnce() ─┐
+        │                                                        │
+        └─ callback ─► verify HMAC ─► applyProviderState ◄────────┘
+                                          │
+                                          ├─ status guard + transaksi DB
+                                          ├─ WalletService.credit
+                                          └─ LedgerService.entry (kind=deposit)
+```
+
+Kredit hanya terjadi satu kali: `applyProviderState` memeriksa status baris di
+dalam `BEGIN IMMEDIATE`, lalu menulis ledger dan status dalam transaksi yang
+sama. `payment_callbacks` menyimpan setiap percobaan (termasuk yang ditolak).
+
+## Alur penarikan & saldo tertahan
+
+```
+POST /withdrawals ─► CurrencyService.requireEnabled('withdrawal')
+                     ├─ validasi limit/biaya (quote)
+                     ├─ WalletService.lockFunds  (balance − locked ≥ amount)
+                     └─ INSERT withdrawals(status=pending) + event + audit
+
+cancel  ─► releaseFunds  (status guard, tepat sekali)
+reject  ─► releaseFunds  + event + audit (alasan wajib)
+complete─► settleLocked   (debit locked + ledger) + event + audit
+```
+
+`wallets.locked_minor` adalah satu-satunya sumber “dana tertahan”. Available
+selalu dihitung `balance − locked`; tidak ada kolom duplikat yang bisa
+menyimpang.
+
+## Chat
+
+`support_messages` menyimpan `sender_role`, `internal`, dan `client_id`
+(unique per percakapan). Pesan ditulis lebih dulu, broadcast kemudian; socket
+hanya sinyal, UI selalu membaca ulang thread dari API.
+
+## Konfigurasi dinamis
+
+`site_settings` (JSON per bagian) dan `feature_flags` dibaca pada setiap
+request (cache proses tidak dipakai agar perubahan admin langsung berlaku).
+Maintenance gate ada di `src/http/app.ts` sesudah rate limit global.
+
+## Migrasi
+
+`003_v4.sql` bersifat aditif: kolom baru (`wallets.locked_minor`), tabel baru,
+dan seed `currencies` (IDR aktif). Database v3 dapat di-upgrade tanpa kehilangan
+data; saldo USD lama tetap ada dan tetap dapat dipakai untuk trading simulasi.

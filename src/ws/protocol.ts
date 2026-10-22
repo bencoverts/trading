@@ -107,7 +107,18 @@ export type ServerMessage =
       closePrice: number;
       trade: TradeViewWire;
     }
-  | { type: 'balance'; wallets: Array<{ currency: string; balance: number; balanceMinor: number }> }
+  | {
+      type: 'balance';
+      wallets: Array<{
+        currency: string;
+        balance: number;
+        balanceMinor: number;
+        locked?: number;
+        lockedMinor?: number;
+        available?: number;
+        availableMinor?: number;
+      }>;
+    }
   | { type: 'account:reset'; wallets: Array<{ currency: string; balance: number; balanceMinor: number }> }
   | {
       type: 'notification';
@@ -120,6 +131,10 @@ export type ServerMessage =
         createdAt: number;
       };
     }
+  | { type: 'deposit:updated'; deposit: Record<string, unknown> }
+  | { type: 'withdrawal:updated'; withdrawal: Record<string, unknown> }
+  | { type: 'chat:message'; message: Record<string, unknown>; conversation: Record<string, unknown> }
+  | { type: 'chat:new'; conversation: Record<string, unknown> }
   | { type: 'pong'; id?: string | number; serverTime: number }
   | {
       type: 'replay';

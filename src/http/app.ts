@@ -17,6 +17,10 @@ import { tradeRoutes } from '../routes/trades.js';
 import { adminRoutes } from '../routes/admin.js';
 import { paymentRoutes } from '../routes/payments.js';
 import { contentRoutes } from '../routes/content.js';
+import { financeRoutes } from '../routes/finance.js';
+import { chatRoutes } from '../routes/chat.js';
+import { webhookRoutes } from '../routes/webhooks.js';
+import { adminV4Routes } from '../routes/adminV4.js';
 import { csrfGuard, ensureCsrfCookie, requireAuth, sessionMiddleware, type AuthedRequest } from './session.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -197,17 +201,42 @@ export function createApp(ctx: AppContext): express.Express {
   );
 
   api.use(globalLimiter);
+
+  // Maintenance gate: staff can keep working, the public (and /auth so a user
+  // can still sign out) gets a clear 503 with the configured message.
+  api.use((req, _res, next) => {
+    const maintenance = ctx.site.get().maintenance;
+    if (!maintenance.enabled) return next();
+    if (req.path.startsWith('/auth') || req.path === '/site' || req.path === '/config') return next();
+    const auth = (req as AuthedRequest).auth;
+    if (auth?.role && maintenance.allowStaff !== false) return next();
+    return next(
+      new AppError('MAINTENANCE_MODE', 503, maintenance.message || 'Platform sedang dalam perawatan. Coba lagi nanti.'),
+    );
+  });
+
   api.use(marketRoutes(ctx));
   api.use(contentRoutes(ctx));
   api.use('/auth', authLimiter, authRoutes(ctx));
   const optionalAuth: express.RequestHandler = (_req, _res, next) => next();
   api.use(accountRoutes(ctx, requireAuth as never, optionalAuth));
   api.use(tradeRoutes(ctx, requireAuth as never, tradeLimiter));
+  // v4 admin routes first: they supersede the v3 payments placeholder
+  api.use('/admin', requireStaff(), adminV4Routes(ctx, requireStaff, requireStaff()));
   api.use('/admin', requireStaff(), adminRoutes(ctx, requireStaff));
+  api.use(financeRoutes(ctx, requireAuth as never));
+  api.use('/chat', chatRoutes(ctx, requireAuth));
   api.use(paymentRoutes(ctx));
   api.use((_req, _res, next) => next(AppError.notFound('Unknown API endpoint')));
 
   app.use('/api/v1', api);
+
+  // Provider callbacks: no session, no CSRF cookie, signature-verified.
+  app.use(
+    '/api',
+    rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }),
+    webhookRoutes(ctx),
+  );
 
   // ------------------------------------------------------------- static UI
   const staticOptions = {

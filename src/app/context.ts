@@ -22,6 +22,11 @@ import type { JobScheduler } from '../jobs/scheduler.js';
 import type { BackupService } from '../jobs/index.js';
 import type { RealtimeServer } from '../ws/server.js';
 import type { PaymentService } from '../payments/service.js';
+import type { CurrencyService } from '../services/currencies.js';
+import type { DepositService } from '../services/deposits.js';
+import type { WithdrawalService } from '../services/withdrawals.js';
+import type { ChatService } from '../services/chat.js';
+import type { SiteService } from '../services/site.js';
 
 export interface AppContext {
   config: Config;
@@ -47,6 +52,11 @@ export interface AppContext {
   tokens: TokenService;
   mailer: Mailer;
   payments: PaymentService;
+  currencies: CurrencyService;
+  deposits: DepositService;
+  withdrawals: WithdrawalService;
+  chat: ChatService;
+  site: SiteService;
   /** null in tests that do not attach a socket server */
   realtime: RealtimeServer | null;
 }
