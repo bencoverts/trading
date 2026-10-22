@@ -6,7 +6,6 @@ async function main() {
   const config = loadConfig();
   const logger = createLogger(config);
   const runtime = await createRuntime({ config, logger, listen: true });
-
   await runtime.start();
 
   let shuttingDown = false;

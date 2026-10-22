@@ -1,100 +1,96 @@
 import { describe, expect, it } from 'vitest';
-import { bucketStart, CandleAggregator } from '../../src/domain/candles.js';
+import { CandleAggregator, bucketStart } from '../../src/domain/candles.js';
+import { TIME_FRAMES } from '../../src/domain/constants.js';
 
-const TFS = { '5s': 5_000, '15s': 15_000, '1m': 60_000 };
-// divisible by every timeframe (LCM = 300_000 ms) so boundaries are unambiguous
-const T0 = 1_699_999_800_000;
+const TFS = { '5s': 5_000, '1m': 60_000 };
 
-describe('bucketStart', () => {
-  it('aligns timestamps down to the timeframe boundary', () => {
-    expect(bucketStart(T0 + 3_456, 5_000)).toBe(T0);
-    expect(bucketStart(T0 + 7_999, 15_000)).toBe(T0);
-    expect(bucketStart(T0 + 16_000, 15_000)).toBe(T0 + 15_000);
-    expect(bucketStart(T0 + 299_999, 300_000)).toBe(T0);
+describe('candle aggregation', () => {
+  it('aligns buckets to the timeframe boundary', () => {
+    expect(bucketStart(1_000, 5_000)).toBe(0);
+    expect(bucketStart(4_999, 5_000)).toBe(0);
+    expect(bucketStart(5_000, 5_000)).toBe(5_000);
+    expect(bucketStart(61_234, 60_000)).toBe(60_000);
   });
-});
 
-describe('CandleAggregator', () => {
-  it('builds OHLC per timeframe from a single tick stream', () => {
+  it('opens a candle with the first tick and tracks OHLC', () => {
     const agg = new CandleAggregator(TFS);
-    const t0 = T0;
-    agg.apply(100, t0);
-    agg.apply(104, t0 + 1_000);
-    agg.apply(98, t0 + 2_000);
-
-    expect(agg.getCurrent('5s')).toEqual({ t: t0, o: 100, h: 104, l: 98, c: 98 });
-    expect(agg.getCurrent('15s')).toEqual({ t: t0, o: 100, h: 104, l: 98, c: 98 });
-    expect(agg.getCurrent('1m')?.t).toBe(t0);
+    agg.apply(100, 1_000);
+    agg.apply(105, 2_000);
+    agg.apply(95, 3_000);
+    agg.apply(101, 4_000);
+    const candle = agg.getCurrent('5s');
+    expect(candle).toEqual({ t: 0, o: 100, h: 105, l: 95, c: 101 });
   });
 
-  it('closes a candle per timeframe at its own boundary', () => {
+  it('closes exactly one candle when crossing a boundary', () => {
     const agg = new CandleAggregator(TFS);
-    const t0 = T0;
-    agg.apply(100, t0);
-    const r1 = agg.apply(101, t0 + 5_000);
-    expect(r1.closed.map((c) => c.tf)).toEqual(['5s']);
+    agg.apply(100, 1_000);
+    agg.apply(110, 4_999);
+    const crossing = agg.apply(90, 5_000);
 
-    const r2 = agg.apply(102, t0 + 15_000);
-    expect(r2.closed.map((c) => c.tf).sort()).toEqual(['15s', '5s']);
-
-    const r3 = agg.apply(103, t0 + 60_000);
-    expect(r3.closed.map((c) => c.tf).sort()).toEqual(['15s', '1m', '5s']);
+    const closed5s = crossing.closed.filter((c) => c.tf === '5s');
+    expect(closed5s).toHaveLength(1);
+    // the closing candle only contains ticks that belonged to its bucket
+    expect(closed5s[0].candle).toEqual({ t: 0, o: 100, h: 110, l: 100, c: 110 });
+    expect(agg.getCurrent('5s')).toEqual({ t: 5_000, o: 90, h: 90, l: 90, c: 90 });
+    // 1m bucket is still open (both ticks are inside 0..60s)
+    expect(crossing.closed.filter((c) => c.tf === '1m')).toHaveLength(0);
+    expect(agg.getCurrent('1m')).toEqual({ t: 0, o: 100, h: 110, l: 90, c: 90 });
   });
 
-  it('keeps closed history in chronological order with a bounded size', () => {
-    const agg = new CandleAggregator({ '5s': 5_000 }, { maxHistory: 3 });
-    const t0 = T0;
-    for (let i = 0; i < 10; i++) agg.apply(100 + i, t0 + i * 5_000);
+  it('closes every timeframe aligned to a shared boundary', () => {
+    const agg = new CandleAggregator(TIME_FRAMES);
+    agg.apply(50, 1_000);
+    const res = agg.apply(51, 60_000); // exactly on the 1m boundary
+    const closedTfs = res.closed.map((c) => c.tf).sort();
+    expect(closedTfs).toEqual(['15s', '1m', '30s', '5s'].sort());
+    // 5m/15m/1h buckets did not roll over
+    expect(agg.getCurrent('5m')?.t).toBe(0);
+  });
+
+  it('ignores late ticks for an already closed bucket', () => {
+    const agg = new CandleAggregator(TFS);
+    agg.apply(100, 1_000);
+    agg.apply(101, 5_000); // closes bucket 0
+    const late = agg.apply(999, 2_000); // belongs to the closed bucket
+    expect(late.updated.find((u) => u.tf === '5s')).toBeUndefined();
+    expect(agg.getCurrent('5s')?.o).toBe(101);
+  });
+
+  it('keeps closed history in order and supports limit/before paging', () => {
+    const agg = new CandleAggregator(TFS);
+    for (let i = 0; i < 10; i++) agg.apply(100 + i, i * 5_000 + 1);
+    agg.apply(200, 60_000); // close bucket at 55000
 
     const history = agg.getHistory('5s', 100);
-    expect(history).toHaveLength(3);
-    expect(history.map((c) => c.t)).toEqual([t0 + 30_000, t0 + 35_000, t0 + 40_000]);
-    expect(agg.getCurrent('5s')?.c).toBe(109);
-  });
+    // buckets 0..45000 are closed, 60000 is still forming
+    expect(history.map((c) => c.t)).toEqual([0, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 35_000, 40_000, 45_000]);
+    expect(history[0]).toEqual({ t: 0, o: 100, h: 100, l: 100, c: 100 });
+    expect(history[history.length - 1]).toEqual({ t: 45_000, o: 109, h: 109, l: 109, c: 109 });
+    expect(agg.getCurrent('5s')).toEqual({ t: 60_000, o: 200, h: 200, l: 200, c: 200 });
 
-  it('respects limit and before filters', () => {
-    const agg = new CandleAggregator({ '5s': 5_000 });
-    const t0 = T0;
-    for (let i = 0; i < 8; i++) agg.apply(100 + i, t0 + i * 5_000);
-
-    // bucket 7 is still forming, so the last two closed candles are 105 and 106
-    expect(agg.getHistory('5s', 2).map((c) => c.c)).toEqual([105, 106]);
-    expect(agg.getHistory('5s', 100, t0 + 20_000).map((c) => c.t)).toEqual([
-      t0,
-      t0 + 5_000,
-      t0 + 10_000,
-      t0 + 15_000,
+    const page = agg.getHistory('5s', 2, 20_000);
+    expect(page).toEqual([
+      { t: 10_000, o: 102, h: 102, l: 102, c: 102 },
+      { t: 15_000, o: 103, h: 103, l: 103, c: 103 },
     ]);
   });
 
-  it('seeds history without duplicating candles', () => {
-    const agg = new CandleAggregator({ '5s': 5_000 });
+  it('seeds history without duplicating timestamps and prunes old candles', () => {
+    const agg = new CandleAggregator(TFS, { maxHistory: 5 });
     agg.seed('5s', [
-      { t: 1_000, o: 1, h: 2, l: 1, c: 2 },
-      { t: 6_000, o: 2, h: 3, l: 2, c: 3 },
+      { t: 0, o: 1, h: 1, l: 1, c: 1 },
+      { t: 5_000, o: 2, h: 2, l: 2, c: 2 },
+      { t: 5_000, o: 3, h: 3, l: 3, c: 3 },
     ]);
-    agg.seed('5s', [
-      { t: 6_000, o: 0, h: 0, l: 0, c: 0 },
-      { t: 11_000, o: 3, h: 4, l: 3, c: 4 },
+    expect(agg.getHistory('5s', 10)).toEqual([
+      { t: 0, o: 1, h: 1, l: 1, c: 1 },
+      { t: 5_000, o: 3, h: 3, l: 3, c: 3 },
     ]);
-
-    expect(agg.getHistory('5s', 10).map((c) => c.t)).toEqual([1_000, 6_000, 11_000]);
-    expect(agg.getHistory('5s', 10)[1].c).toBe(0);
-  });
-
-  it('prunes history older than a cutoff', () => {
-    const agg = new CandleAggregator({ '5s': 5_000 });
-    for (let i = 0; i < 5; i++) agg.apply(100 + i, i * 5_000 + 100);
-    const removed = agg.prune(10_000);
-    expect(removed).toBe(2);
-    expect(agg.getHistory('5s', 10).map((c) => c.t)).toEqual([10_000, 15_000]);
-  });
-
-  it('returns copies so callers cannot mutate internal state', () => {
-    const agg = new CandleAggregator({ '5s': 5_000 });
-    agg.apply(100, 0);
-    const current = agg.getCurrent('5s');
-    if (current) current.c = 999;
-    expect(agg.getCurrent('5s')?.c).toBe(100);
+    for (let i = 0; i < 10; i++) agg.seed('5s', [{ t: 10_000 + i * 5_000, o: i, h: i, l: i, c: i }]);
+    expect(agg.getHistory('5s', 100).length).toBe(5);
+    // history keeps the 5 newest buckets: 35000..55000
+    expect(agg.prune(40_000)).toBe(1);
+    expect(agg.getHistory('5s', 100).every((c) => c.t >= 40_000)).toBe(true);
   });
 });

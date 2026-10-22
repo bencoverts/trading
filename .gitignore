@@ -1,9 +1,12 @@
 node_modules/
 dist/
-coverage/
-.env
-*.log
 data/*.sqlite
 data/*.sqlite-*
 data/*.db
+coverage/
+.env
+.env.*
+!.env.example
+*.log
 .DS_Store
+.vitest/

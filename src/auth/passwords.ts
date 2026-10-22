@@ -5,10 +5,10 @@ export interface PasswordHasher {
   verify(hash: string, password: string): Promise<boolean>;
 }
 
-/** argon2id with parameters from the environment (OWASP-ish defaults). */
+/** argon2id with parameters from the environment. */
 export function createPasswordHasher(opts: { memoryCost: number; timeCost: number }): PasswordHasher {
   return {
-    hash(password: string) {
+    hash(password) {
       return argon2.hash(password, {
         type: argon2.argon2id,
         memoryCost: opts.memoryCost,
@@ -16,7 +16,7 @@ export function createPasswordHasher(opts: { memoryCost: number; timeCost: numbe
         parallelism: 1,
       });
     },
-    async verify(hash: string, password: string) {
+    async verify(hash, password) {
       try {
         return await argon2.verify(hash, password);
       } catch {
