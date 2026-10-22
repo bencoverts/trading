@@ -1,203 +1,263 @@
-# Test Report
+# Laporan Pengujian
 
-_Last run: the numbers below come from `npx vitest run` and
-`npm run typecheck` on Node 22.22.3 (Linux x64), SQLite driver `node:sqlite`._
+Dijalankan pada **2026-10-22**, Node **22.22.3** (Linux x64), driver SQLite
+**`node:sqlite`** (fallback; `better-sqlite3` tidak tersedia di sandbox — lihat
+“Keterbatasan”). Semua angka di bawah adalah keluaran nyata dari perintah yang
+tertulis, bukan perkiraan.
 
-## Summary
+## Ringkasan
 
-| suite | file | tests | result |
-| --- | --- | --- | --- |
-| unit — payout & money | `test/unit/payout.test.ts` | 12 | pass |
-| unit — candle aggregation | `test/unit/candles.test.ts` | 7 | pass |
-| unit — price engine & feed | `test/unit/price-engine.test.ts` | 12 | pass |
-| integration — public market API | `test/integration/market-api.test.ts` | 11 | pass |
-| integration — auth & security | `test/integration/auth.test.ts` | 12 | pass |
-| integration — trade creation/validation | `test/integration/trades.test.ts` | 14 | pass |
-| integration — concurrent balance safety | `test/integration/concurrency.test.ts` | 3 | pass |
-| integration — settlement | `test/integration/settlement.test.ts` | 8 | pass |
-| integration — admin & payments stubs | `test/integration/admin.test.ts` | 19 | pass |
-| integration — account & demo wallet | `test/integration/account.test.ts` | 11 | pass |
-| integration — WebSocket | `test/integration/ws.test.ts` | 9 | pass |
-| integration — browser UI (jsdom) | `test/integration/frontend.test.ts` | 5 | pass |
-| **total** | **12 files** | **123** | **123 pass, 0 fail** |
+| Pemeriksaan          | Perintah                            | Hasil                                              |
+| -------------------- | ----------------------------------- | -------------------------------------------------- |
+| Tes unit + integrasi | `npx vitest run`                    | **166 lulus / 166**, 15 file, 0 gagal, ~4,1 s      |
+| Typecheck            | `npm run typecheck`                 | bersih (0 diagnostik)                              |
+| Lint                 | `npx eslint .`                      | bersih (0 error, 0 warning)                        |
+| Build                | `npm run build`                     | sukses (`tsc` → `dist/`)                           |
+| Audit produksi       | `npm audit --omit=dev`              | **0 kerentanan**                                   |
+| Audit penuh          | `npm audit`                         | 3 (semua dev-only: vitest/tinypool)                |
+| E2E Playwright       | `npx playwright test`               | **tidak dijalankan** — browser tidak dapat diunduh |
+| Beban WebSocket      | `node test/load/ws-load.mjs 500 12` | 500 klien, 0 error                                 |
 
 ```
-Test Files  12 passed (12)
-     Tests  123 passed (123)
-  Duration  ~4.5 s
+Test Files  15 passed (15)
+     Tests  166 passed (166)
+  Duration  3.85s
 ```
 
-`npm run typecheck` (`tsc -p tsconfig.json --noEmit` + `tsc -p tsconfig.test.json`)
-exits 0 with no diagnostics.
+## Rincian per file
 
-## What is actually verified
+| Suite                                      | File                                   |     Tes | Hasil           |
+| ------------------------------------------ | -------------------------------------- | ------: | --------------- |
+| unit — payout & uang                       | `test/unit/payout.test.ts`             |      12 | lulus           |
+| unit — agregasi candle                     | `test/unit/candles.test.ts`            |       7 | lulus           |
+| unit — price engine & feed                 | `test/unit/price-engine.test.ts`       |      12 | lulus           |
+| unit — validasi zod & jadwal               | `test/unit/validation.test.ts`         |      12 | lulus           |
+| unit — keamanan (hash, CSRF, upload, uang) | `test/unit/security.test.ts`           |      12 | lulus           |
+| integrasi — auth & sesi                    | `test/integration/auth.test.ts`        |      14 | lulus           |
+| integrasi — trade & validasi               | `test/integration/trades.test.ts`      |      13 | lulus           |
+| integrasi — konkurensi saldo               | `test/integration/concurrency.test.ts` |       5 | lulus           |
+| integrasi — settlement                     | `test/integration/settlement.test.ts`  |       9 | lulus           |
+| integrasi — market API publik              | `test/integration/market-api.test.ts`  |      11 | lulus           |
+| integrasi — admin, audit, payments         | `test/integration/admin.test.ts`       |      23 | lulus           |
+| integrasi — akun & dompet demo             | `test/integration/account.test.ts`     |      14 | lulus           |
+| integrasi — akses per peran                | `test/integration/access.test.ts`      |       7 | lulus           |
+| integrasi — WebSocket                      | `test/integration/ws.test.ts`          |       7 | lulus           |
+| integrasi — UI browser (jsdom)             | `test/integration/frontend.test.ts`    |       8 | lulus           |
+| **total**                                  | **15 file**                            | **166** | **semua lulus** |
 
-### Price simulation and candles
-* Tick prices are finite, strictly positive and quantised to the market's
-  decimals; invalid input (`0`, `NaN`) is rejected.
-* The feed is deterministic for a seeded RNG and drifts up/down with the admin
-  trend. `liar` produces a wider range than `sepi`.
-* Sequence numbers increase per market independently.
-* Buckets align to timeframe boundaries; one tick crossing a boundary emits
-  exactly one `candle_closed`; a shared boundary closes `5s`, `15s`, `30s` and
-  `1m` together while `5m`/`15m`/`1h` stay open.
-* Late ticks for an already closed bucket do not mutate history.
-* History paging (`limit`, `before`) returns closed candles only and stops at the
-  requested boundary; seeding de-duplicates timestamps; pruning drops old ones.
-* `priceAt(expiry)` resolves the last tick at or before an instant and returns
-  `null` when nothing exists.
+## Apa yang benar-benar diverifikasi
 
-### Payout and settlement
-* UP wins above entry, DOWN wins below entry, equal prices are a draw for both
-  directions (including `0.1 + 0.2` float noise).
-* Profit mode: stake + 85 % on win, 0 on loss, refund on draw; rounding is to
-  whole minor units. Total mode treats the rate as the total return.
-* Integration: win → balance `+85 %` profit; lose → stake gone; draw → exact
-  refund; DOWN wins on a falling price; nothing settles before `expiryTime`.
-* Two consecutive settlement passes pay once (claim-based
+### Harga, candle, chart data
+
+- Harga selalu berhingga, > 0, dan terkuantisasi ke desimal market; input tidak
+  valid (`0`, `NaN`) ditolak.
+- Feed deterministik untuk RNG ber-seed; tren `up`/`down` menggeser drift;
+  `liar` menghasilkan rentang lebih lebar daripada `sepi`.
+- Nomor urut (seq) naik per market secara independen.
+- Bucket candle sejajar batas timeframe; satu tick yang melewati batas
+  menutup tepat satu candle; batas bersama menutup `5s/15s/30s/1m` sekaligus
+  sementara `5m/15m/1h` tetap terbuka.
+- Tick terlambat untuk bucket yang sudah ditutup tidak mengubah riwayat.
+- Paging (`limit`, `before`) hanya mengembalikan candle tertutup; data yang
+  sama tidak terduplikasi saat seeding; pruning menghapus yang lama.
+- `priceAt(expiry)` mengembalikan tick terakhir pada/sebelum waktu tertentu dan
+  `null` bila tidak ada.
+
+### Payout & settlement
+
+- UP menang di atas entry, DOWN menang di bawah entry, harga sama = seri untuk
+  kedua arah (termasuk noise float `0.1 + 0.2`).
+- Mode profit: menang = stake + 85 %, kalah = 0, seri = refund; pembulatan ke
+  satuan minor. Mode total diperlakukan sebagai total return.
+- Integrasi: menang → saldo +85 % profit; kalah → stake hangus; seri → refund
+  persis; DOWN menang saat harga turun; tidak ada settlement sebelum
+  `expiryTime`.
+- Dua putaran settlement berurutan hanya membayar sekali (klaim
   `UPDATE … WHERE status='open'`).
-* A trade that expired while the process was down is settled by the next boot
-  (verified with the real server: place 10 s trade → SIGTERM → restart → the
-  trade is `closed`, `settledBy: expiry`).
-* When no tick exists after entry, the stake is refunded instead of inventing a
-  result.
+- Trade yang kedaluwarsa saat proses mati diselesaikan saat boot berikutnya
+  (`settledBy: "expiry"`).
+- Tanpa tick setelah entry → refund, bukan hasil karangan.
 
-### Balance safety (mandatory `BEGIN IMMEDIATE` requirement)
-* 25 parallel `POST /trades` of $100 against a $1,000 balance → exactly **10**
-  succeed, 15 fail with `INSUFFICIENT_FUNDS`, wallet ends at `0`, and the sum of
-  stakes equals the amount debited.
-* A second burst after the balance is exhausted creates nothing (wallet stays
-  `>= 0`, enforced by `CHECK (balance_minor >= 0)` as well).
-* A manually pinned balance is honoured by the next request (no stale reads).
+### Keselamatan saldo (`BEGIN IMMEDIATE`)
 
-### Validation and trading rules
-* `durationSec` outside 5–28800 → `400`; inside the range but not on the admin
-  allow-list (e.g. 7) → `422 DURATION_NOT_ALLOWED`.
-* Amount below minimum / above maximum → `422 AMOUNT_NOT_ALLOWED`; zero or
-  negative → `400`.
-* Unknown direction/timeframe → `400`; unknown market → `404 MARKET_NOT_FOUND`.
-* Paused market → `422 MARKET_PAUSED`; withdrawn (`active=false`) → no trades.
-* Unauthenticated trade → `401`; another user's trade → `404`.
-* Max-open-trades limit is enforced after the admin lowers it to 1.
-* Idempotency: same key + same payload → same trade, one debit, `200` +
-  `Idempotent-Replayed`; same key + different payload → `409`.
+- 25 `POST /trades` paralel sebesar $100 terhadap saldo $1 000 → tepat **10**
+  berhasil, 15 gagal `INSUFFICIENT_FUNDS`, saldo akhir 0, dan total stake sama
+  dengan debit.
+- Burst kedua setelah saldo habis tidak membuat trade (saldo tetap ≥ 0; juga
+  dijaga `CHECK (balance_minor >= 0)`).
+- Saldo yang diubah manual langsung dihormati request berikutnya (tanpa stale
+  read).
 
-### Accounts, sessions, security
-* Registration creates USD/IDR/USDT wallets with the configured starting
-  balances and a verification link; duplicate email/username → `409` with
-  distinct codes; short password/invalid email → `400` with per-field details.
-* Verification tokens are single use; reset tokens are single use and revoke old
-  sessions (`token_version`); the old password stops working.
-* Forgot-password answers identically for unknown addresses (no enumeration).
-* Login by email **or** username; wrong password → `401`; blocked user → `403`
-  and their existing session is revoked.
-* Auth rate limiting returns `429` after the configured number of attempts.
-* Logout clears the cookie (`Max-Age=0`/expiry) and requires a session for the
-  first call.
-* Helmet headers present (`CSP`, `nosniff`, no `x-powered-by`); CORS echoes only
-  allow-listed origins (the configured list, plus same-host requests so a
-  reverse proxy / preview domain works) and never an arbitrary origin.
-* Bearer tokens work as an alternative to the cookie; garbage tokens → `401`.
-* Admin: anonymous → `401` and normal user → `403` on every admin route; a JWT
-  whose payload claims `role: admin` (invalid signature) → `401`, and a valid
-  non-admin token → `403` (the database is the source of truth).
-* Admin market/settings/wallet/block/manual-settlement actions are written to the
-  audit log with actor, target, previous value and reason; manual settlement
-  without a reason → `400`, twice → `409`.
-* Payments endpoints validate their payload then answer `501 NOT_AVAILABLE`
-  ("belum tersedia").
+### Validasi & aturan trading
+
+- `durationSec` di luar 5–28 800 → `400`; di dalam rentang tetapi tidak ada di
+  allow-list (mis. 7) → `422 DURATION_NOT_ALLOWED`.
+- Nominal di bawah min / di atas max → `422 AMOUNT_NOT_ALLOWED`; nol/negatif →
+  `400`.
+- Arah/timeframe tak dikenal → `400`; market tak dikenal → `404`.
+- Market dipause → `422 MARKET_PAUSED`; market non-aktif tidak bisa ditradingkan.
+- Tanpa sesi → `401`; trade milik pengguna lain → `404`.
+- Batas trade terbuka dihormati setelah admin menurunkannya menjadi 1.
+- Idempotensi: key sama + payload sama → trade sama, satu debit, `200` +
+  `Idempotent-Replayed`; key sama + payload beda → `409`.
+
+### Akun, sesi, keamanan
+
+- Registrasi membuat dompet USD/IDR/USDT dengan saldo awal terkonfigurasi dan
+  tautan verifikasi; email/username duplikat → `409` dengan kode berbeda;
+  password pendek/email invalid → `400` dengan detail per field.
+- Token verifikasi sekali pakai; token reset sekali pakai dan mencabut sesi
+  lama (`token_version`); password lama berhenti bekerja.
+- Lupa password menjawab identik untuk email tak dikenal (tanpa enumerasi).
+- Login lewat email **atau** username; password salah → `401`; pengguna
+  diblokir → `403` dan sesinya dicabut.
+- Rate limit auth mengembalikan `429` setelah batas; lockout akun berfungsi.
+- Logout menghapus cookie (`Max-Age=0`); daftar sesi bisa dilihat dan dicabut;
+  “keluarkan perangkat lain” menyisakan sesi saat ini.
+- Header Helmet ada (CSP, `nosniff`, tanpa `x-powered-by`); CORS hanya
+  menggemakan origin yang diizinkan (plus same-host untuk proxy/preview) dan
+  tidak pernah origin sembarang.
+- Bearer token berfungsi sebagai alternatif cookie; token sampah → `401`.
+- Admin: anonim → `401`, pengguna biasa → `403` di setiap rute admin; JWT dengan
+  klaim `role: admin` tetapi tanda tangan salah → `401`; token valid non-admin →
+  `403` (database adalah sumber kebenaran).
+- Aksi admin (market, pengaturan, saldo, blokir, settlement manual) tercatat di
+  audit beserta aktor, target, nilai sebelumnya, dan alasan; settlement manual
+  tanpa alasan → `400`, dua kali → `409`.
+- Upload: konten non-gambar ditolak, batas 512 KB berlaku, nama file diacak.
+- Endpoint pembayaran memvalidasi payload lalu menjawab `501 NOT_AVAILABLE`.
 
 ### WebSocket
-* `hello` advertises markets/timeframes and `simulation: true`.
-* Subscribing yields the snapshot plus live `tick` and `candle` frames for that
-  market only; `candle_closed` arrives once per boundary, never throttled.
-* `ping` → `pong`; malformed JSON → `INVALID_JSON` without dropping the socket;
-  unknown market/timeframe → `MARKET_NOT_FOUND` / `TIMEFRAME_NOT_SUPPORTED`.
-* `resume` replays missed ticks with `seq > lastSeq`; a stale sequence gets
+
+- `hello` mengumumkan market/timeframe dan `simulation: true`.
+- `subscribe` mengirim snapshot lalu `tick`/`candle` live hanya untuk market
+  tersebut; `candle_closed` muncul sekali per batas, tidak pernah di-throttle.
+- `ping` → `pong`; JSON rusak → `INVALID_JSON` tanpa memutus socket; market/
+  timeframe tak dikenal → `MARKET_NOT_FOUND`/`TIMEFRAME_NOT_SUPPORTED`.
+- `resume` memutar ulang tick dengan `seq > lastSeq`; seq terlalu tua →
   `resync`.
-* Token-authenticated sockets receive `trade:opened` and `balance` pushes.
-* A foreign browser origin is refused by the origin check.
+- Socket terautentikasi menerima `trade:opened` dan push `balance`.
+- Origin browser asing ditolak.
 
-### Browser UI (jsdom against the real server)
-* The app boots, fetches `/config`, `/account` and `/markets`, and renders the
-  trading layout: 3 markets, chart canvas, 7 timeframes, BUY/SELL, quick amount
-  buttons (`½`, `x2`, `min`, `max`), 12 duration presets, payout preview, and the
-  **SIMULASI** label.
-* A market switch plus a server tick updates the live price through the
-  WebSocket (verified `0.43210` for DOGE).
-* Login, register and forgot-password pages render and navigation does not throw.
-* Signed-in flow: demo balance shows in the header, BUY opens the confirmation
-  dialog (market, entry price, payout), confirming creates the trade and it
-  appears in the open-trades list.
-* No uncaught errors or unhandled rejections in the window during the run.
+### UI browser (jsdom terhadap server nyata)
 
-### Operationally verified (manual, not automated)
-* `npm run build` (tsc → `dist/`) and `npm start` under `NODE_ENV=production`
-  with a real `JWT_SECRET`/`ADMIN_PASSWORD`: `/healthz` → 200, static UI → 200
-  for HTML/CSS/JS, register → wallets, trade → settlement after 5 s
-  (`lose`, payout 0, `settledBy: expiry`).
-* Graceful `SIGTERM` shutdown (flushes ticks/candles, closes sockets) and restart
-  on the same database, including catch-up settlement of a trade that expired
-  during downtime.
-* `npm run migrate` and `npm run seed` are idempotent (second run applies
-  nothing).
-* Fixed: `before` paging had appended the forming candle; ticks were only
-  buffered after `start()`; the WS fan-out keyed ticks by `market|tf` so nothing
-  was delivered. All three are covered by the tests above now.
+- Aplikasi boot, mengambil `/config`, `/account`, `/markets`, lalu merender
+  layout trading: 3 market, canvas chart, 7 timeframe, BUY/SELL, tombol nominal
+  cepat (½, ×2, min, maks), 12 preset durasi, pratinjau payout, dan label
+  **SIMULASI**.
+- Pindah market + tick server memperbarui harga live via WebSocket.
+- Halaman login/daftar/lupa-password dirender dan navigasi tidak melempar error.
+- Alur masuk: saldo demo tampil di header, BUY membuka dialog konfirmasi
+  (market, harga entry, payout), konfirmasi membuat trade, dan trade muncul di
+  daftar trade terbuka.
+- Halaman staf: login sebagai `super_admin`, lalu `/account` (tab dompet),
+  `/history` (filter bar), `/notifications`, dan `/admin` (navigasi dengan
+  bagian Pengguna & Sistem) dirender tanpa error.
+- Tidak ada error tak tertangani / unhandled rejection selama pengujian.
 
-## Failures found and fixed during development
+### Operasional (diverifikasi manual)
 
-Recorded because an "all green" report is only meaningful with the history:
+- `npm run build` lalu `npm start` dengan `NODE_ENV=production` dan rahasia
+  nyata: `/healthz` 200, UI statis 200 (HTML/CSS/JS), registrasi → dompet,
+  trade → settle setelah 5 s.
+- `SIGTERM` menutup rapi (flush tick/candle, tutup socket) dan restart pada
+  database yang sama, termasuk catch-up settlement.
+- `npm run migrate` dan `npm run seed` idempoten.
+- UI dijalankan lewat dev server (port 3000) dan diperiksa manual di browser;
+  tangkapan layar tidak tersedia di sandbox ini.
 
-0. Under a proxied host the WebSocket handshake and CORS rejected the
-   same-host origin (the check compared against the configured list only). Both
-   now also accept "origin host == request host"; the strict list is still
-   enforced for anything else.
-1. Candle paging returned the forming candle on the second page (fixed in
-   `MarketDataService.candles`; asserted in `market-api.test.ts`).
-2. Tick buffering depended on `start()` being called, so short-lived runtimes
-   lost ticks (subscribed in the constructor; asserted in `market-api` and
-   `candle` tests).
-3. WebSocket tick fan-out never matched a subscription (wrong key) — caught by
-   `ws.test.ts` after it was written.
-4. Settings cross-field validation threw a bare `Error` → HTTP 500; now a
-   `400 VALIDATION_ERROR` with the reason.
-5. Test-only issues: supertest does not persist cookies between requests; the
-   WS `hello` frame arrives before a listener is attached (buffered in the test
-   helper); jsdom's `WebSocket` breaks if the Node `Event` global is replaced
-   (the harness keeps Node's `Event`).
+## Beban WebSocket
 
-## Known gaps / not verified
+`node test/load/ws-load.mjs 500 12` terhadap server lokal
+(`PORT=3305`, database sementara, 3 market):
 
-* **No real browser was used** (the sandbox has no headless Chrome). The UI is
-  verified through jsdom with a stubbed 2D canvas context: DOM wiring, data flow
-  and the WebSocket path are exercised, but **visual layout, canvas rendering
-  and CSS are not pixel-tested**. Please eyeball it in a browser.
-* **`better-sqlite3` was never exercised on this machine.** Its native binding
-  could not be downloaded or compiled in the sandbox (no network access to
-  `nodejs.org`), so every test ran on the `node:sqlite` fallback. The adapter's
-  `better-sqlite3` path is the primary documented driver and shares the same
-  SQL; it is pinned in `package.json` and should be smoke-tested on the target
-  host. The fallback prints `ExperimentalWarning: SQLite is an experimental
-  feature` on Node 22.
-* No load/soak test (throughput, memory under many sockets), no fuzzing.
-* Email delivery is a dev mailer; no SMTP/API provider was tested.
-* Payments are stubs by design — nothing real-money was implemented or tested.
-* Admin UI is covered indirectly (API tests + shared component code); the
-  admin screens themselves are **not** part of the jsdom test.
-* Timezone rendering in the UI uses the browser locale; tests do not assert
-  formatted dates.
-* SQLite is single-writer; concurrency beyond one process was not tested.
+| Metrik                     | Hasil                      |
+| -------------------------- | -------------------------- |
+| Klien diminta / tersambung | 500 / **500**              |
+| Error handshake/pesan      | **0**                      |
+| Pesan diterima             | 122 000 (~**9 990/detik**) |
+| Delay tick p50 / p95 / max | **36 ms / 67 ms / 71 ms**  |
+| Waktu koneksi p50          | 161 ms                     |
+| RSS server                 | 86 MB                      |
 
-## How to reproduce
+Server uji dihentikan setelah run; file `data/loadtest.sqlite*` dihapus.
 
-```bash
-npm install --ignore-scripts   # or plain npm install with a C++ toolchain / prebuilt binaries
-npm run typecheck
-npm test
+## `npm audit`
+
+```
+3 vulnerabilities (1 moderate, 2 critical)
 ```
 
-The suite uses in-memory-equivalent temporary SQLite files, a fake clock, no
-background timers and `RATE_*` limits raised for most tests (the rate-limit test
-opts back in). No network access is required except when the jsdom test boots a
-local server on `127.0.0.1`.
+| Paket                     | Tingkat  | Jalur                  |
+| ------------------------- | -------- | ---------------------- |
+| `tinypool` ≤ 2.1.1        | critical | devDependency `vitest` |
+| `@vitest/mocker` ≤ 4.1.11 | moderate | devDependency `vitest` |
+| `vitest` ≤ 4.1.10         | —        | pembungkus keduanya    |
+
+**Tidak ada kerentanan pada dependensi produksi** (`npm audit --omit=dev` → 0).
+Ketiganya hanya aktif saat menjalankan tes, tidak dikirim ke runtime, dan
+perbaikannya menuntut `vitest@5` (breaking) — tidak dilakukan di rilis ini agar
+rangkaian 166 tes tetap stabil. Rencana: naikkan `vitest` ke 5.x pada rilis
+berikutnya dan jalankan ulang seluruh suite.
+
+## E2E Playwright — **belum dijalankan**
+
+`playwright.config.ts` dan `e2e/smoke.spec.ts` selesai dan terdaftar:
+
+```
+npx playwright test --list   →  8 tes / 2 proyek (desktop Chrome, Pixel 7)
+```
+
+Skenario: (1) registrasi → buka trade → lihat hasil, (2) login akun seed,
+(3) admin menambah market + logo lalu market tampil untuk pengguna, (4) trade
+panel menjadi bottom sheet di mobile.
+
+Menjalankan tes gagal karena browser tidak tersedia:
+
+```
+npx playwright install chromium  →  Download failure (sandbox tanpa akses CDN)
+Error: browserType.launch: Executable doesn't exist …
+```
+
+Jadi **tidak ada** klaim bahwa E2E lulus. Jalankan di mesin dengan akses
+internet:
+
+```bash
+npx playwright install --with-deps chromium
+npm run test:e2e
+```
+
+## Keterbatasan & hal yang tidak diverifikasi
+
+- **Tidak ada browser sungguhan** di sandbox. UI diverifikasi via jsdom dengan
+  canvas 2D distub: DOM, alur data, dan WebSocket teruji, tetapi **tata letak,
+  render canvas, dan CSS tidak diuji piksel**. Mohon dicek manual di browser.
+- **`better-sqlite3` tidak pernah dieksekusi** di mesin ini (binding native
+  tidak bisa diunduh/dikompilasi). Semua tes memakai `node:sqlite`. Jalur
+  primer didokumentasikan dan SQL-nya sama, tetapi perlu smoke test di host
+  target.
+- **Playwright E2E** dan **tangkapan layar desktop/mobile** belum dijalankan
+  (butuh browser).
+- Tidak ada fuzzing, uji soak jangka panjang, atau uji multi-proses (SQLite
+  satu penulis).
+- Email tetap dev mailer (tautan dicetak di log); tidak ada SMTP/API provider.
+- Pembayaran adalah stub by design — tidak ada yang diuji karena tidak ada yang
+  diimplementasikan.
+- Tampilan tanggal mengikuti locale browser; tes tidak mengunci format tanggal.
+- Rate limit di sebagian tes dinaikkan agar cepat; tes khusus rate limit
+  mengaktifkannya kembali.
+
+## Cara mereproduksi
+
+```bash
+npm ci --ignore-scripts
+npm run typecheck
+npx eslint .
+npx vitest run
+npm run build
+npm audit --omit=dev
+node test/load/ws-load.mjs 500 12   # butuh server berjalan di WS_URL
+```
+
+Tes memakai file SQLite sementara, jam palsu, tanpa timer latar, dan tanpa
+akses jaringan selain loopback.

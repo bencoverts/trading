@@ -1,0 +1,583 @@
+openapi: 3.1.0
+info:
+  title: SimTrade Demo API
+  version: 3.0.0
+  description: |
+    SIMULATION-ONLY trading API. No real money, no deposits, no withdrawals and
+    no third-party integrations. Every market/trade payload contains
+    `simulation: true`; public payloads also carry `label: "SIMULASI"`.
+    Mutations need the double-submit CSRF header, trades also need an
+    `Idempotency-Key`.
+servers:
+  - url: http://localhost:3000/api/v1
+    description: local development
+tags:
+  - name: public
+  - name: auth
+  - name: account
+  - name: trades
+  - name: admin
+  - name: payments
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sim_session
+    csrf:
+      type: apiKey
+      in: header
+      name: x-csrf-token
+    idempotency:
+      type: apiKey
+      in: header
+      name: Idempotency-Key
+
+  parameters:
+    Symbol:
+      name: symbol
+      in: path
+      required: true
+      schema: { type: string, example: DOGE }
+    Timeframe:
+      name: tf
+      in: query
+      required: false
+      schema: { type: string, enum: ['5s', '15s', '30s', '1m', '5m', '15m', '1h'], default: '1m' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: INSUFFICIENT_FUNDS }
+            message: { type: string, example: 'Saldo demo tidak cukup' }
+            details: {}
+
+    Candle:
+      type: object
+      required: [t, o, h, l, c]
+      properties:
+        t: { type: integer, description: epoch ms, bucket start, example: 1792682400000 }
+        o: { type: number, example: 0.42888 }
+        h: { type: number, example: 0.42931 }
+        l: { type: number, example: 0.42861 }
+        c: { type: number, example: 0.42902 }
+
+    Ticker:
+      type: object
+      properties:
+        price: { type: number, nullable: true, example: 0.42902 }
+        priceDecimals: { type: integer, example: 5 }
+        change24h: { type: number, nullable: true, example: 0.00121 }
+        change24hPercent: { type: number, nullable: true, example: 0.28 }
+        high24h: { type: number, nullable: true, example: 0.4331 }
+        low24h: { type: number, nullable: true, example: 0.4244 }
+        serverTime: { type: integer, example: 1792682410476 }
+
+    Market:
+      type: object
+      properties:
+        symbol: { type: string, example: DOGE }
+        name: { type: string, example: Dogecoin (simulasi) }
+        description: { type: string, nullable: true }
+        category: { type: string, enum: [index, crypto, forex, komoditas, lainnya] }
+        logoUrl: { type: string, nullable: true, example: /uploads/markets/abc.png }
+        priceDecimals: { type: integer, example: 5 }
+        minAmount: { type: number, nullable: true, example: 1 }
+        maxAmount: { type: number, nullable: true, example: 500 }
+        payoutRate: { type: number, nullable: true, example: 0.87 }
+        featured: { type: boolean }
+        status: { type: string, enum: [active, paused, inactive, draft, deleted] }
+        paused: { type: boolean }
+        open: { type: boolean }
+        sortOrder: { type: integer }
+        simulation: { type: boolean, const: true }
+        label: { type: string, const: SIMULASI }
+        ticker: { $ref: '#/components/schemas/Ticker' }
+
+    Wallets:
+      type: array
+      items:
+        type: object
+        properties:
+          currency: { type: string, enum: [USD, IDR, USDT] }
+          balance: { type: number, example: 1000 }
+          balanceMinor: { type: integer, example: 100000 }
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        username: { type: string }
+        displayName: { type: string, nullable: true }
+        staffRole: { type: string, nullable: true, enum: [super_admin, operator, support, viewer, null] }
+        emailVerified: { type: boolean }
+        twoFactorEnabled: { type: boolean }
+        displayCurrency: { type: string, enum: [USD, IDR, USDT] }
+        createdAt: { type: integer }
+
+    Trade:
+      type: object
+      properties:
+        id: { type: string }
+        market: { type: string }
+        direction: { type: string, enum: [up, down] }
+        currency: { type: string, enum: [USD, IDR, USDT] }
+        amount: { type: number, example: 10 }
+        amountMinor: { type: integer, example: 1000 }
+        durationSec: { type: integer, example: 60 }
+        entryPrice: { type: number, example: 0.42888 }
+        entryTime: { type: integer }
+        expiryTime: { type: integer }
+        closePrice: { type: number, nullable: true }
+        status: { type: string, enum: [open, closed] }
+        result: { type: string, nullable: true, enum: [win, lose, draw, null] }
+        payoutRate: { type: number, example: 0.85 }
+        payout: { type: number, nullable: true }
+        profit: { type: number, nullable: true }
+        settledBy: { type: string, nullable: true, enum: [expiry, admin, null] }
+        settleReason: { type: string, nullable: true }
+        sim: { type: boolean, const: true }
+        livePrice: { type: number, nullable: true }
+        estimatedResult: { type: string, nullable: true }
+        estimatedPayout: { type: number, nullable: true }
+
+paths:
+  /config:
+    get:
+      tags: [public]
+      summary: Public trading configuration
+      responses:
+        '200':
+          description: configuration
+          content:
+            application/json:
+              example:
+                simulation: true
+                label: SIMULASI
+                durations: { allowed: [5, 10, 15, 30, 60, 300], minSec: 5, maxSec: 28800 }
+                payout: { rate: 0.85, mode: profit, byDuration: {} }
+                currencies: [{ code: USD, decimals: 2 }]
+                rates: { USD: 1, IDR: 16000, USDT: 1 }
+
+  /markets:
+    get:
+      tags: [public]
+      summary: List active markets with tickers
+      responses:
+        '200':
+          description: markets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  simulation: { type: boolean }
+                  label: { type: string }
+                  markets:
+                    type: array
+                    items: { $ref: '#/components/schemas/Market' }
+
+  /markets/{symbol}:
+    get:
+      tags: [public]
+      summary: Market detail with 1m candles
+      parameters: [{ $ref: '#/components/parameters/Symbol' }]
+      responses:
+        '200':
+          description: market
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Market'
+                  - type: object
+                    properties:
+                      candles: { type: array, items: { $ref: '#/components/schemas/Candle' } }
+                      current: { $ref: '#/components/schemas/Candle' }
+        '404':
+          {
+            description: MARKET_NOT_FOUND,
+            content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } },
+          }
+
+  /markets/{symbol}/candles:
+    get:
+      tags: [public]
+      summary: Server candles for one timeframe
+      parameters:
+        - { $ref: '#/components/parameters/Symbol' }
+        - { $ref: '#/components/parameters/Timeframe' }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000, default: 300 } }
+        - {
+            name: before,
+            in: query,
+            schema: { type: integer },
+            description: 'return candles strictly before this epoch ms',
+          }
+      responses:
+        '200':
+          description: candles
+          content:
+            application/json:
+              example:
+                market: DOGE
+                tf: 1m
+                simulation: true
+                label: SIMULASI
+                candles: [{ t: 1792682340000, o: 0.42871, h: 0.42902, l: 0.42843, c: 0.42888 }]
+                current: { t: 1792682400000, o: 0.42888, h: 0.42931, l: 0.42861, c: 0.42902 }
+
+  /markets/{symbol}/ticks:
+    get:
+      tags: [public]
+      summary: Recent ticks (replay / gap fill)
+      parameters:
+        - { $ref: '#/components/parameters/Symbol' }
+        - { name: since, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 5000, default: 500 } }
+      responses:
+        '200': { description: ticks }
+
+  /markets/{symbol}/history:
+    get:
+      tags: [public]
+      summary: Public simulation-parameter history
+      parameters: [{ $ref: '#/components/parameters/Symbol' }]
+      responses:
+        '200':
+          description: history
+          content:
+            application/json:
+              example:
+                market: DOGE
+                entries:
+                  - id: 12
+                    action: admin.market_simulated
+                    actorRole: admin
+                    before: { trend: neutral, mood: liar }
+                    after: { trend: up, mood: normal }
+                    createdAt: 1792682410000
+
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Create a demo account (session cookie is set)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, username, password, acceptTerms]
+              properties:
+                email: { type: string, format: email }
+                username: { type: string, pattern: '^[A-Za-z0-9_.-]{3,24}$' }
+                password: { type: string, minLength: 8 }
+                acceptTerms: { type: boolean, const: true }
+                language: { type: string, enum: [id, en], default: id }
+      responses:
+        '201': { description: session created }
+        '409': { description: EMAIL_TAKEN / USERNAME_TAKEN }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Log in with email or username
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, password]
+              properties:
+                identifier: { type: string, example: demo }
+                password: { type: string, example: demo-password-123 }
+                totpCode: { type: string, example: '123456' }
+      responses:
+        '200':
+          description: 'session, or `{ totpRequired: true }` when 2FA is required'
+          content:
+            application/json:
+              example:
+                user: { id: u_1, email: demo@simtrade.local, username: demo, staffRole: null }
+                wallets: [{ currency: USD, balance: 1000, balanceMinor: 100000 }]
+                csrfToken: 8f2c…
+                simulation: true
+        '401': { description: INVALID_CREDENTIALS }
+        '423': { description: ACCOUNT_LOCKED }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current session (or `{user:null}`)
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: session }
+
+  /auth/sessions:
+    get:
+      tags: [auth]
+      summary: List active sessions
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: sessions }
+
+  /account:
+    get:
+      tags: [account]
+      summary: Profile, wallets, limits and cooldowns
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: account }
+    patch:
+      tags: [account]
+      summary: Update profile / preferences
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            example: { displayName: Demo, language: id, timezone: Asia/Jakarta, displayCurrency: USD }
+      responses:
+        '200': { description: updated }
+        '409': { description: CURRENCY_LOCKED }
+
+  /account/reset:
+    post:
+      tags: [account]
+      summary: Reset all demo balances (cooldown)
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '200': { description: wallets reset }
+
+  /wallet/topup:
+    post:
+      tags: [account]
+      summary: Add virtual demo balance (capped, cooldown)
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            example: { currency: USD, amount: 100 }
+      responses:
+        '201': { description: top-up applied (virtual money) }
+        '429': { description: COOLDOWN }
+
+  /wallet/convert:
+    post:
+      tags: [account]
+      summary: Convert between demo currencies using the demo FX rate
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '201': { description: conversion recorded }
+
+  /trades:
+    post:
+      tags: [trades]
+      summary: Open a trade (Idempotency-Key mandatory)
+      security: [{ sessionCookie: [], csrf: [], idempotency: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [market, direction, currency, amount, durationSec]
+              properties:
+                market: { type: string, example: DOGE }
+                direction: { type: string, enum: [up, down] }
+                currency: { type: string, enum: [USD, IDR, USDT] }
+                amount: { type: number, example: 10 }
+                durationSec: { type: integer, minimum: 5, maximum: 28800, example: 60 }
+      responses:
+        '201':
+          description: trade opened
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trade: { $ref: '#/components/schemas/Trade' }
+                  wallets: { $ref: '#/components/schemas/Wallets' }
+        '200': { description: idempotent replay (header Idempotent-Replayed) }
+        '422': { description: AMOUNT_NOT_ALLOWED / DURATION_NOT_ALLOWED / INSUFFICIENT_FUNDS }
+        '409': { description: IDEMPOTENCY_KEY_REUSED / MARKET_PAUSED / EXPOSURE_LIMIT }
+    get:
+      tags: [trades]
+      summary: User trade history with filters
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [all, open, closed], default: all } }
+        - { name: market, in: query, schema: { type: string } }
+        - { name: result, in: query, schema: { type: string, enum: [win, lose, draw] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200': { description: trades + total }
+
+  /trades/active:
+    get:
+      tags: [trades]
+      summary: Open trades with live estimates
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: active trades }
+
+  /trades/preview:
+    post:
+      tags: [trades]
+      summary: Preview payout/profit without creating a trade
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses:
+        '200': { description: preview }
+
+  /admin/dashboard:
+    get:
+      tags: [admin]
+      summary: Dashboard cards, charts and alerts
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: stats }
+        '403': { description: FORBIDDEN (missing permission) }
+
+  /admin/markets:
+    get:
+      tags: [admin]
+      summary: List markets (including drafts/deleted)
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: markets }
+    post:
+      tags: [admin]
+      summary: Create a market (logo path from /admin/uploads/image)
+      security: [{ sessionCookie: [], csrf: [] }]
+      requestBody:
+        content:
+          application/json:
+            example:
+              symbol: EURUSD_DEMO
+              name: EUR/USD (simulasi)
+              category: forex
+              priceDecimals: 4
+              startPrice: 1.085
+              tickSize: 0.0001
+              volatilityPreset: rendah
+              mood: sepi
+              minAmountUsd: 1
+              maxAmountUsd: 500
+              activate: true
+      responses:
+        '201': { description: created (bootstrap ticks + candles generated) }
+        '409': { description: MARKET_SYMBOL_TAKEN }
+
+  /admin/markets/{symbol}/simulate:
+    post:
+      tags: [admin]
+      summary: Tune simulation parameters (audited, visible to users)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/Symbol' }]
+      requestBody:
+        content:
+          application/json:
+            example: { trend: up, trendStrength: 7, volatilityPreset: tinggi, mood: normal, paused: false }
+      responses:
+        '200': { description: market + engine + history }
+
+  /admin/markets/{symbol}:
+    patch:
+      tags: [admin]
+      summary: Edit market metadata/limits
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/Symbol' }]
+      responses: { '200': { description: updated } }
+    delete:
+      tags: [admin]
+      summary: Soft delete (blocked while open trades exist)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters: [{ $ref: '#/components/parameters/Symbol' }]
+      responses:
+        '200': { description: deleted }
+        '409': { description: MARKET_HAS_OPEN_TRADES }
+
+  /admin/trades:
+    get:
+      tags: [admin]
+      summary: All trades with filters
+      security: [{ sessionCookie: [] }]
+      responses: { '200': { description: trades } }
+
+  /admin/trades/{id}/settle:
+    post:
+      tags: [admin]
+      summary: Manual settlement (mandatory reason, audited)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            example: { reason: koreksi data uji, closePrice: 0.431 }
+      responses:
+        '200': { description: settled }
+        '403': { description: FORBIDDEN (trades.settle permission) }
+
+  /admin/users/{id}/wallet:
+    post:
+      tags: [admin]
+      summary: Adjust demo balance (reason mandatory, ledgered)
+      security: [{ sessionCookie: [], csrf: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            example: { currency: USD, mode: add, amount: 100, reason: bonus demo }
+      responses: { '200': { description: wallet } }
+
+  /admin/settings:
+    get:
+      tags: [admin]
+      summary: Runtime settings
+      security: [{ sessionCookie: [] }]
+      responses: { '200': { description: settings } }
+    patch:
+      tags: [admin]
+      summary: Update settings (audited)
+      security: [{ sessionCookie: [], csrf: [] }]
+      responses: { '200': { description: settings } }
+
+  /payments/deposit:
+    post:
+      tags: [payments]
+      summary: Always unavailable (simulation-only build)
+      requestBody:
+        content:
+          application/json:
+            example: { currency: USD, amount: 10, method: qris }
+      responses:
+        '501':
+          description: NOT_AVAILABLE
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { code: NOT_AVAILABLE, message: 'Deposit is not available in this build' } }
+
+  /payments/methods:
+    get:
+      tags: [payments]
+      summary: Placeholder status for the "Segera hadir" page
+      responses:
+        '200':
+          description: disabled
+          content:
+            application/json:
+              example:
+                { enabled: false, status: not_available, message: 'Modul pembayaran belum tersedia', methods: [] }
