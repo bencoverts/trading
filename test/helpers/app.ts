@@ -7,6 +7,7 @@ import { loadConfig, type Config } from '../../src/config.js';
 import { createRuntime, type Runtime } from '../../src/bootstrap.js';
 import { FakeClock } from '../../src/lib/clock.js';
 import { Database } from '../../src/db/sqlite.js';
+import type { StaffRole } from '../../src/auth/permissions.js';
 
 export const TEST_ADMIN = { email: 'admin@test.local', username: 'testadmin', password: 'test-admin-password' };
 
@@ -22,7 +23,6 @@ export function testConfig(overrides: Record<string, string> = {}): Config {
     ADMIN_PASSWORD: TEST_ADMIN.password,
     ARGON2_MEMORY_KIB: '1024',
     ARGON2_TIME_COST: '1',
-    // the suite shares one app instance, so only the rate-limit test opts in
     RATE_AUTH_MAX: '1000',
     RATE_TRADE_MAX: '1000',
     RATE_GLOBAL_MAX: '100000',
@@ -32,7 +32,10 @@ export function testConfig(overrides: Record<string, string> = {}): Config {
 
 export interface TestContext {
   runtime: Runtime;
+  /** raw supertest handle (no cookies, no CSRF) */
   api: () => request.SuperTest<request.Test>;
+  /** cookie/CSRF-aware client */
+  client: () => HttpClient;
   clock: FakeClock;
   db: Database;
   dbPath: string;
@@ -41,14 +44,15 @@ export interface TestContext {
 }
 
 /**
- * Full app on an in-memory database with a fake clock, no timers started and
- * no listeners opened. Tests drive prices through `runtime.ctx.engine.ingest`.
+ * Full app on a temporary database file with a fake clock, no timers started
+ * and no listeners opened. Tests drive prices through `runtime.ctx.engine`.
  */
-export async function createTestApp(opts: { env?: Record<string, string>; seed?: boolean; backfill?: boolean } = {}): Promise<TestContext> {
+export async function createTestApp(
+  opts: { env?: Record<string, string>; seed?: boolean; backfill?: boolean; demoData?: boolean } = {},
+): Promise<TestContext> {
   const config = testConfig(opts.env);
   const clock = new FakeClock();
   const logger = pino({ level: 'silent' });
-  // a real file (not :memory:) so tests can reopen the same database
   const dbPath = mkdtempSync(path.join(os.tmpdir(), 'simtrade-')).concat(`/db-${(counter += 1)}.sqlite`);
   const db = new Database(dbPath);
 
@@ -60,8 +64,10 @@ export async function createTestApp(opts: { env?: Record<string, string>; seed?:
     attachRealtime: false,
     startEngine: false,
     runSettlementLoop: false,
+    startJobs: false,
     backfill: opts.backfill ?? false,
     seed: opts.seed ?? true,
+    demoData: opts.demoData ?? false,
   });
 
   const api = () => request(runtime.app) as unknown as request.SuperTest<request.Test>;
@@ -69,6 +75,7 @@ export async function createTestApp(opts: { env?: Record<string, string>; seed?:
   return {
     runtime,
     api,
+    client: () => new HttpClient(runtime),
     clock,
     db,
     dbPath,
@@ -86,37 +93,157 @@ export function reopen(ctx: TestContext): Database {
   return new Database(ctx.dbPath);
 }
 
+type Method = 'get' | 'post' | 'patch' | 'put' | 'delete';
+
+interface RequestOptions {
+  body?: unknown;
+  headers?: Record<string, string>;
+  idempotencyKey?: string | null;
+  /** when true, skips the CSRF header (used to prove CSRF is enforced) */
+  noCsrf?: boolean;
+  expect?: number;
+}
+
+/**
+ * Minimal browser-like HTTP client: keeps cookies between requests and echoes
+ * the CSRF cookie in the header exactly like the SPA does.
+ */
+export class HttpClient {
+  readonly cookies = new Map<string, string>();
+  constructor(private readonly runtime: Runtime) {}
+
+  csrfToken(): string | undefined {
+    return this.cookies.get(this.runtime.ctx.config.CSRF_COOKIE);
+  }
+
+  sessionCookie(): string | undefined {
+    return this.cookies.get(this.runtime.ctx.config.COOKIE_NAME);
+  }
+
+  private capture(res: request.Response): void {
+    const raw = res.headers['set-cookie'];
+    if (!raw) return;
+    const list = Array.isArray(raw) ? raw : [String(raw)];
+    for (const cookie of list) {
+      const [pair] = cookie.split(';');
+      const index = pair.indexOf('=');
+      const name = pair.slice(0, index);
+      const value = pair.slice(index + 1);
+      if (!value) this.cookies.delete(name);
+      else this.cookies.set(name, value);
+    }
+  }
+
+  async request(method: Method, url: string, opts: RequestOptions = {}): Promise<request.Response> {
+    let req = request(this.runtime.app)[method](url) as request.Test;
+    if (this.cookies.size) {
+      req = req.set('Cookie', [...this.cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; '));
+    }
+    const csrf = this.csrfToken();
+    if (csrf && !opts.noCsrf) req = req.set(this.runtime.ctx.config.CSRF_HEADER, csrf);
+    for (const [key, value] of Object.entries(opts.headers ?? {})) req = req.set(key, value);
+    if (opts.idempotencyKey !== null) {
+      req = req.set(
+        'Idempotency-Key',
+        opts.idempotencyKey ?? `test-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      );
+    }
+    if (opts.body !== undefined) req = req.send(opts.body as object);
+    const res = await req;
+    this.capture(res);
+    if (opts.expect !== undefined && res.status !== opts.expect) {
+      throw new Error(
+        `expected ${opts.expect} for ${method.toUpperCase()} ${url}, got ${res.status}: ${JSON.stringify(res.body)}`,
+      );
+    }
+    return res;
+  }
+
+  get(url: string, opts: RequestOptions = {}) {
+    return this.request('get', url, opts);
+  }
+  post(url: string, body?: unknown, opts: RequestOptions = {}) {
+    return this.request('post', url, { ...opts, body });
+  }
+  patch(url: string, body?: unknown, opts: RequestOptions = {}) {
+    return this.request('patch', url, { ...opts, body });
+  }
+  put(url: string, body?: unknown, opts: RequestOptions = {}) {
+    return this.request('put', url, { ...opts, body });
+  }
+  delete(url: string, opts: RequestOptions = {}) {
+    return this.request('delete', url, opts);
+  }
+}
+
+export interface TestUser {
+  userId: string;
+  email: string;
+  username: string;
+  password: string;
+  client: HttpClient;
+}
+
 export async function registerUser(
-  api: request.SuperTest<request.Test>,
+  ctx: TestContext,
   suffix = Math.random().toString(36).slice(2, 8),
-): Promise<{ cookies: string[]; userId: string; email: string; username: string; password: string }> {
+): Promise<TestUser> {
+  const client = ctx.client();
+  await client.get('/api/v1/config');
   const username = `user_${suffix}`;
   const email = `${username}@example.com`;
   const password = 'password-12345';
-  const res = await api.post('/api/v1/auth/register').send({ email, username, password }).expect(201);
-  const cookies = cookiesFrom(res);
-  return { cookies, userId: res.body.user.id as string, email, username, password };
+  const res = await client.post('/api/v1/auth/register', {
+    email,
+    username,
+    password,
+    acceptTerms: true,
+  });
+  if (res.status !== 201) throw new Error(`register failed: ${res.status} ${JSON.stringify(res.body)}`);
+  return { userId: res.body.user.id as string, email, username, password, client };
 }
 
-export async function login(
-  api: request.SuperTest<request.Test>,
-  identifier: string,
-  password: string,
-): Promise<string[]> {
-  const res = await api.post('/api/v1/auth/login').send({ identifier, password }).expect(200);
-  return cookiesFrom(res);
+export async function login(ctx: TestContext, identifier: string, password: string): Promise<HttpClient> {
+  const client = ctx.client();
+  await client.get('/api/v1/config');
+  const res = await client.post('/api/v1/auth/login', { identifier, password });
+  if (res.status !== 200) throw new Error(`login failed for ${identifier}: ${res.status} ${JSON.stringify(res.body)}`);
+  return client;
 }
 
-export async function loginAdmin(api: request.SuperTest<request.Test>): Promise<string[]> {
-  return login(api, TEST_ADMIN.email, TEST_ADMIN.password);
+export async function loginAdmin(ctx: TestContext): Promise<HttpClient> {
+  return login(ctx, TEST_ADMIN.email, TEST_ADMIN.password);
 }
 
-export function cookiesFrom(res: request.Response): string[] {
-  const raw = res.headers['set-cookie'];
-  if (!raw) return [];
-  return Array.isArray(raw) ? raw.map((c) => c.split(';')[0]) : [String(raw).split(';')[0]];
+/** Creates a user with a staff role through the service layer (no admin needed). */
+export async function createStaffUser(
+  ctx: TestContext,
+  role: StaffRole,
+  suffix = Math.random().toString(36).slice(2, 8),
+): Promise<TestUser> {
+  const user = await registerUser(ctx, suffix);
+  ctx.runtime.ctx.users.setStaffRole(user.userId, role, { userId: user.userId, role: 'admin' });
+  // role change bumps token_version: re-login so the session carries the new version
+  const client = await login(ctx, user.email, user.password);
+  return { ...user, client };
 }
 
-export function withCookies(req: request.Test, cookies: string[]): request.Test {
-  return cookies.length ? req.set('Cookie', cookies.join('; ')) : req;
+/** Advances the fake clock and records one tick per market at the current price. */
+export function tick(ctx: TestContext, advanceMs = 250): void {
+  ctx.clock.advance(advanceMs);
+  for (const symbol of ctx.runtime.ctx.engine.symbols) {
+    const price = ctx.runtime.ctx.engine.lastPrice(symbol) ?? 100;
+    ctx.runtime.ctx.engine.ingest(symbol, price, ctx.clock.now());
+  }
+}
+
+/** Pushes one explicit price at the current (fake) clock time. */
+export function pushPrice(ctx: TestContext, symbol: string, price: number): void {
+  ctx.runtime.ctx.engine.ingest(symbol, price, ctx.clock.now());
+}
+
+/** Seeds an initial tick so `entryPrice` exists without a running engine. */
+export function seedPrice(ctx: TestContext, symbol: string, price: number): void {
+  ctx.runtime.ctx.engine.setPrice(symbol, price);
+  ctx.runtime.ctx.engine.ingest(symbol, price, ctx.clock.now());
 }

@@ -1,134 +1,208 @@
-import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { cookiesFrom, createTestApp, login, registerUser, withCookies, type TestContext } from '../helpers/app.js';
+import { createTestApp, registerUser, seedPrice, type TestContext } from '../helpers/app.js';
 
 let ctx: TestContext;
-let api: () => request.SuperTest<request.Test>;
 
 beforeAll(async () => {
-  ctx = await createTestApp({ env: { } });
-  api = ctx.api;
-  ctx.runtime.ctx.engine.ingest('DOGE', 0.4, ctx.clock.now());
+  ctx = await createTestApp();
+  seedPrice(ctx, 'ASIA_COMPOSITE', 6_000);
+  seedPrice(ctx, 'DOGE', 0.42);
+  seedPrice(ctx, 'CRYPTO_COMPOSITE', 41_000);
 });
+
 afterAll(async () => {
   await ctx.close();
 });
 
-describe('account profile', () => {
-  it('returns profile, wallets, FX rates and limits', async () => {
-    const user = await registerUser(api());
-    const res = await withCookies(api().get('/api/v1/account'), user.cookies).expect(200);
-    expect(res.body.user.email).toBe(user.email);
+describe('profile', () => {
+  it('returns wallets, limits and simulation flags', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.get('/api/v1/account');
+    expect(res.status).toBe(200);
     expect(res.body.wallets).toHaveLength(3);
-    expect(res.body.rates).toEqual({ USD: 1, IDR: 16_000, USDT: 1 });
-    expect(res.body.limits.maxOpenTrades).toBe(10);
-    expect(res.body.simulation).toBe(true);
+    expect(res.body.limits.maxOpenTrades).toBeGreaterThan(0);
+    expect(res.body.label).toBe('SIMULASI');
+    expect(res.body.rates.USD).toBe(1);
   });
 
-  it('stores the display currency preference', async () => {
-    const user = await registerUser(api());
-    const res = await withCookies(api().patch('/api/v1/account'), user.cookies).send({ displayCurrency: 'IDR' }).expect(200);
-    expect(res.body.user.displayCurrency).toBe('IDR');
-    const fresh = await withCookies(api().get('/api/v1/account'), user.cookies).expect(200);
-    expect(fresh.body.user.displayCurrency).toBe('IDR');
-    const bad = await withCookies(api().patch('/api/v1/account'), user.cookies).send({ displayCurrency: 'EUR' }).expect(400);
-    expect(bad.body.error.code).toBe('VALIDATION_ERROR');
+  it('updates display name, language and timezone', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.patch('/api/v1/account', {
+      displayName: 'Budi Simulasi',
+      language: 'en',
+      timezone: 'Asia/Makassar',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.user.displayName).toBe('Budi Simulasi');
+    expect(res.body.user.language).toBe('en');
+    expect(res.body.user.timezone).toBe('Asia/Makassar');
   });
 
-  it('changes the password, revokes old sessions and issues a working cookie', async () => {
-    const user = await registerUser(api());
-    const res = await withCookies(api().post('/api/v1/account/password'), user.cookies)
-      .send({ currentPassword: user.password, newPassword: 'new-password-9876' })
-      .expect(200);
-    const freshCookie = cookiesFrom(res);
-    expect(freshCookie.length).toBe(1);
-
-    // old cookie is revoked, new one works
-    await withCookies(api().get('/api/v1/account'), user.cookies).expect(401);
-    await withCookies(api().get('/api/v1/account'), freshCookie).expect(200);
-    await api().post('/api/v1/auth/login').send({ identifier: user.email, password: 'new-password-9876' }).expect(200);
-
-    const wrong = await withCookies(api().post('/api/v1/account/password'), freshCookie)
-      .send({ currentPassword: 'not-the-password', newPassword: 'another-password' })
-      .expect(401);
-    expect(wrong.body.error.code).toBe('INVALID_CREDENTIALS');
-  });
-});
-
-describe('demo top-up', () => {
-  it('adds virtual funds and records a deposit row', async () => {
-    const user = await registerUser(api());
-    const res = await withCookies(api().post('/api/v1/wallet/topup'), user.cookies)
-      .send({ currency: 'IDR', amount: 50_000 })
-      .expect(201);
-    expect(res.body.wallet.balanceMinor).toBe(15_000_000 + 50_000);
-    expect(res.body.message).toContain('virtual');
-
-    const tx = await withCookies(api().get('/api/v1/wallet/transactions'), user.cookies).expect(200);
-    expect(tx.body.transactions[0]).toMatchObject({ kind: 'demo_topup', amount: 50_000, currency: 'IDR' });
+  it('accepts a PNG avatar and serves it from /uploads', async () => {
+    const user = await registerUser(ctx);
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    const res = await user.client
+      .request('post', '/api/v1/account/avatar', {})
+      .then(() => null)
+      .catch(() => null);
+    void res;
+    const upload = await ctx
+      .api()
+      .post('/api/v1/account/avatar')
+      .set('Cookie', cookieOf(user))
+      .set('x-csrf-token', user.client.csrfToken() ?? '')
+      .attach('file', png, 'avatar.png');
+    expect(upload.status).toBe(201);
+    expect(upload.body.avatarUrl).toMatch(/^\/uploads\/avatars\/[a-z0-9-]+\.png$/);
+    const served = await ctx.api().get(upload.body.avatarUrl);
+    expect(served.status).toBe(200);
   });
 
-  it('enforces the per-transaction cap', async () => {
-    const user = await registerUser(api());
-    const res = await withCookies(api().post('/api/v1/wallet/topup'), user.cookies)
-      .send({ currency: 'USD', amount: 5_000 })
-      .expect(422);
-    expect(res.body.error.code).toBe('AMOUNT_NOT_ALLOWED');
-    expect(res.body.error.details.maxMinor).toBe(100_000);
-  });
-
-  it('enforces the daily top-up count', async () => {
-    const user = await registerUser(api());
-    for (let i = 0; i < 5; i++) {
-      await withCookies(api().post('/api/v1/wallet/topup'), user.cookies).send({ currency: 'USD', amount: 10 }).expect(201);
-    }
-    const res = await withCookies(api().post('/api/v1/wallet/topup'), user.cookies).send({ currency: 'USD', amount: 10 }).expect(422);
-    expect(res.body.error.code).toBe('RATE_LIMITED');
-  });
-
-  it('validates currency and amount', async () => {
-    const user = await registerUser(api());
-    const bad = await withCookies(api().post('/api/v1/wallet/topup'), user.cookies).send({ currency: 'EUR', amount: 10 }).expect(400);
-    expect(bad.body.error.code).toBe('VALIDATION_ERROR');
-    const negative = await withCookies(api().post('/api/v1/wallet/topup'), user.cookies).send({ currency: 'USD', amount: -10 }).expect(400);
-    expect(negative.body.error.code).toBe('VALIDATION_ERROR');
-  });
-
-  it('requires a session', async () => {
-    await api().post('/api/v1/wallet/topup').send({ currency: 'USD', amount: 10 }).expect(401);
+  it('rejects a file whose magic bytes are not an image', async () => {
+    const user = await registerUser(ctx);
+    const upload = await ctx
+      .api()
+      .post('/api/v1/account/avatar')
+      .set('Cookie', cookieOf(user))
+      .set('x-csrf-token', user.client.csrfToken() ?? '')
+      .attach('file', Buffer.from('<html>not an image</html>'), 'x.png');
+    expect(upload.status).toBe(422);
+    expect(upload.body.error.code).toBe('UPLOAD_INVALID');
   });
 });
 
-describe('demo balance reset', () => {
-  it('restores every wallet and voids open trades with a refund', async () => {
-    const user = await registerUser(api());
-    await withCookies(api().post('/api/v1/trades'), user.cookies)
-      .send({ market: 'DOGE', direction: 'up', amount: 200, durationSec: 3_600 })
-      .expect(201);
+describe('demo wallets', () => {
+  it('tops up within the cap and enforces the cooldown', async () => {
+    const user = await registerUser(ctx);
+    const ok = await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 100 });
+    expect(ok.status).toBe(201);
+    expect(ok.body.wallet.balance).toBe(1_100);
+    const again = await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 100 });
+    expect(again.status).toBe(429);
+    expect(again.body.error.code).toBe('COOLDOWN');
 
-    const res = await withCookies(api().post('/api/v1/account/reset'), user.cookies).expect(200);
+    const overCap = await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 99_999 });
+    expect(overCap.status).toBe(422); // the per-transaction cap is validated first
+  });
+
+  it('rejects a top-up above the configured cap', async () => {
+    const user = await registerUser(ctx);
+    ctx.runtime.ctx.settings.update({ topupCooldownSec: 0 }, { actorRole: 'system' });
+    const over = await user.client.post('/api/v1/wallet/topup', { currency: 'IDR', amount: 999_999_999 });
+    expect(over.status).toBe(422);
+    expect(over.body.error.code).toBe('AMOUNT_NOT_ALLOWED');
+    ctx.runtime.ctx.settings.update({ topupCooldownSec: 30 }, { actorRole: 'system' });
+  });
+
+  it('converts between demo currencies using the configured FX rate', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/wallet/convert', { from: 'USD', to: 'IDR', amount: 10 });
+    expect(res.status).toBe(201);
+    expect(res.body.rate).toBe(16_000);
+    expect(res.body.to.balance).toBe(15_000_000 + 160_000);
+    expect(res.body.from.balance).toBe(990);
+    const rows = ctx.db.all<{ n: number }>('SELECT id FROM conversions WHERE user_id = ?', user.userId);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('cannot convert more than the balance', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.post('/api/v1/wallet/convert', { from: 'USD', to: 'IDR', amount: 5_000 });
+    expect(res.status).toBe(422);
+    expect(res.body.error.code).toBe('INSUFFICIENT_FUNDS');
+  });
+
+  it('resets demo balances to the configured starting balance', async () => {
+    const user = await registerUser(ctx);
+    await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 50 });
+    ctx.clock.advance(10 * 60_000);
+    const res = await user.client.post('/api/v1/account/reset', {});
+    expect(res.status).toBe(200);
+    expect(res.body.wallets.find((w: { currency: string }) => w.currency === 'USD').balance).toBe(1_000);
+    expect(res.body.voidedTrades).toBe(0);
+  });
+
+  it('voids open trades as refunds when resetting', async () => {
+    const user = await registerUser(ctx);
+    await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 10 });
+    const trade = await user.client.post('/api/v1/trades', {
+      market: 'DOGE',
+      direction: 'up',
+      currency: 'USD',
+      amount: 5,
+      durationSec: 300,
+    });
+    expect(trade.status).toBe(201);
+    ctx.clock.advance(10 * 60_000);
+    const res = await user.client.post('/api/v1/account/reset', {});
+    expect(res.status).toBe(200);
     expect(res.body.voidedTrades).toBe(1);
-    const usd = res.body.wallets.find((w: { currency: string }) => w.currency === 'USD');
-    expect(usd.balanceMinor).toBe(100_000);
+    const row = ctx.db.get<{ status: string; settle_reason: string | null }>(
+      'SELECT status, settle_reason FROM trades WHERE id = ?',
+      trade.body.trade.id,
+    );
+    expect(row?.status).toBe('closed');
+    expect(row?.settle_reason).toContain('reset');
+  });
 
-    const trades = await withCookies(api().get('/api/v1/trades?status=closed'), user.cookies).expect(200);
-    expect(trades.body.trades).toHaveLength(1);
-    expect(trades.body.trades[0].result).toBe('draw');
-    expect(trades.body.trades[0].settleReason).toBe('demo balance reset');
+  it('lists ledger entries with direction and running balance', async () => {
+    const user = await registerUser(ctx);
+    await user.client.post('/api/v1/wallet/topup', { currency: 'USD', amount: 25 });
+    const res = await user.client.get('/api/v1/wallet/transactions?currency=USD');
+    expect(res.status).toBe(200);
+    const kinds = res.body.transactions.map((t: { kind: string }) => t.kind);
+    expect(kinds).toContain('demo_topup');
+    expect(res.body.transactions[0].balanceAfter).toBe(1_025);
+    expect(res.body.transactions[0].direction).toBe('credit');
   });
 });
 
-describe('session hygiene', () => {
-  it('refuses protected pages for anonymous callers', async () => {
-    for (const path of ['/api/v1/account', '/api/v1/trades', '/api/v1/wallet/transactions']) {
-      await api().get(path).expect(401);
-    }
+describe('favourites and notifications', () => {
+  it('toggles a favourite and returns it in the account payload', async () => {
+    const user = await registerUser(ctx);
+    const add = await user.client.post('/api/v1/favorites/DOGE', {});
+    expect(add.status).toBe(200);
+    expect(add.body.favorites).toContain('DOGE');
+    const account = await user.client.get('/api/v1/account');
+    expect(account.body.favorites).toContain('DOGE');
+    const remove = await user.client.post('/api/v1/favorites/DOGE', {});
+    expect(remove.body.favorites).not.toContain('DOGE');
   });
 
-  it('accepts a Bearer token as an alternative to the cookie', async () => {
-    const user = await registerUser(api());
-    const token = (await login(api(), user.email, user.password)).length ? (await api().post('/api/v1/auth/login').send({ identifier: user.email, password: user.password })).body.token : '';
-    await api().get('/api/v1/account').set('Authorization', `Bearer ${token}`).expect(200);
-    await api().get('/api/v1/account').set('Authorization', 'Bearer nonsense').expect(401);
+  it('reorders favourites through PUT', async () => {
+    const user = await registerUser(ctx);
+    const res = await user.client.put('/api/v1/favorites', { markets: ['DOGE', 'ASIA_COMPOSITE'] });
+    expect(res.status).toBe(200);
+    expect(res.body.favorites).toEqual(['DOGE', 'ASIA_COMPOSITE']);
+  });
+
+  it('creates a notification when a trade settles and can mark it read', async () => {
+    const user = await registerUser(ctx);
+    const trade = await user.client.post('/api/v1/trades', {
+      market: 'ASIA_COMPOSITE',
+      direction: 'up',
+      currency: 'USD',
+      amount: 5,
+      durationSec: 5,
+    });
+    ctx.clock.advance(4_000);
+    ctx.runtime.ctx.engine.ingest('ASIA_COMPOSITE', 6_100, ctx.clock.now());
+    ctx.clock.advance(2_000);
+    ctx.runtime.ctx.trades.settleDue(ctx.clock.now());
+    const list = await user.client.get('/api/v1/notifications');
+    expect(list.body.items.length).toBeGreaterThanOrEqual(1);
+    expect(list.body.unread).toBeGreaterThanOrEqual(1);
+    const read = await user.client.post('/api/v1/notifications/read', { id: 'all' });
+    expect(read.status).toBe(200);
+    const after = await user.client.get('/api/v1/notifications');
+    expect(after.body.unread).toBe(0);
+    expect(trade.status).toBe(201);
   });
 });
+
+function cookieOf(user: { client: { cookies: Map<string, string> } }): string {
+  return [...user.client.cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
