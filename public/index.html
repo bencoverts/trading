@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="description" content="Demo trading platform - virtual money only" />
+    <title>Demo Trading · Live Chart</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="toolbar">
+      <div class="group" id="types">
+        <button type="button" data-type="candle" class="on">Candle</button>
+        <button type="button" data-type="ohlc">OHLC</button>
+        <button type="button" data-type="line">Line</button>
+        <button type="button" data-type="area">Area</button>
+      </div>
+      <div class="group" id="tfs">
+        <button type="button" data-tf="5s" class="on">5s</button>
+        <button type="button" data-tf="15s">15s</button>
+        <button type="button" data-tf="30s">30s</button>
+        <button type="button" data-tf="1m">1m</button>
+        <button type="button" data-tf="5m">5m</button>
+      </div>
+      <div class="group">
+        <button type="button" id="live">● Live</button>
+        <span class="conn offline" id="conn">offline</span>
+      </div>
+    </div>
+
+    <div class="hud">
+      <div class="sym" id="symbolName">ASIA COMPOSITE INDEX</div>
+      <div class="px" id="px">—</div>
+      <div class="chg" id="chg"></div>
+      <div class="ohlc" id="ohlc"></div>
+    </div>
+
+    <canvas id="c"></canvas>
+
+    <aside class="trade" id="tradePanel">
+      <header>
+        <h2>Demo account</h2>
+        <span class="who" id="who">not signed in</span>
+      </header>
+
+      <div class="balance">
+        <strong id="balance">—</strong>
+        <small>USD · virtual</small>
+      </div>
+
+      <form id="tradeForm" autocomplete="off">
+        <div class="field">
+          <label for="amount">Amount</label>
+          <input id="amount" name="amount" type="number" value="10" min="1" step="0.01" inputmode="decimal" />
+        </div>
+        <div class="field">
+          <label for="duration">Duration</label>
+          <select id="duration" name="duration"></select>
+        </div>
+        <div class="actions">
+          <button type="submit" class="buy" data-dir="up">BUY ▲</button>
+          <button type="submit" class="sell" data-dir="down">SELL ▼</button>
+        </div>
+      </form>
+
+      <div class="meta">
+        <span id="limits">—</span>
+        <span id="payout">—</span>
+      </div>
+
+      <p class="hint" id="hint">
+        <strong>Demo only.</strong> Virtual balance, no deposits and no real money.
+        <button type="button" class="link" id="signInBtn">Sign in</button> or
+        <button type="button" class="link" id="resetBtn">reset balance</button>.
+      </p>
+
+      <div class="field">
+        <label>Open trades <span id="openCount"></span></label>
+        <ul class="list" id="openTrades">
+          <li class="empty">no open trades</li>
+        </ul>
+      </div>
+
+      <div class="field">
+        <label>Recent results</label>
+        <ul class="list" id="history">
+          <li class="empty">no trades yet</li>
+        </ul>
+      </div>
+    </aside>
+
+    <section class="modal" id="authModal" hidden>
+      <form class="card" id="authForm" autocomplete="off">
+        <h2>Demo account</h2>
+        <p>Create or sign in to a virtual account. Starting balance is set by the server; this is not a real brokerage account.</p>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" type="email" required />
+        </div>
+        <div class="field">
+          <label for="password">Password (min 8 characters)</label>
+          <input id="password" type="password" minlength="8" required />
+        </div>
+        <div class="error" id="authError"></div>
+        <div class="row">
+          <button type="submit" class="btn primary" id="loginBtn">Sign in</button>
+          <button type="button" class="btn" id="registerBtn">Register</button>
+        </div>
+        <button type="button" class="btn ghost" id="closeAuth">Continue as guest</button>
+        <button type="button" class="btn ghost" id="signOutBtn" hidden>Sign out</button>
+      </form>
+    </section>
+
+    <div class="toasts" id="toasts"></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
